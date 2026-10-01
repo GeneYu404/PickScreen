@@ -31,6 +31,14 @@ bun run build:exe        # = tauri build --no-bundle
 
 前端单独构建 `bun run build` 约 6 秒；完整 `build:exe` 约 2 分钟（大部分在 Rust 链接）。
 
+### 构建产物统一归档到 `D:\Tool`
+
+打包好的可执行文件**一律放进 `D:\Tool`**，不要留在项目目录里散落：
+
+- `bun run build:exe` 产出后，把 `pickscreen.exe` 复制到 `D:\Tool\`
+- 交付给用户的文件是 `D:\Tool\pickscreen.exe`
+- `src-tauri/target/release/` 属构建缓存，**不是**交付物
+
 ## 3. `src-tauri/target` —— 绝对不能动
 
 它是 **mbx 缓存 symlink**（mode `l----` → `D:\mbx\targets\v1\<hash>`，hash 来自 `Cargo.lock`）。
