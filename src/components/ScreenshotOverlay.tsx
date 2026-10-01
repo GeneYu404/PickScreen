@@ -19,14 +19,15 @@ import {
   Pause,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import type { Desktop, Rect, DetectRegion } from '../sim/desktop';
+import type { ScreenFrame, Rect, DetectRegion } from '../bridge/desktop';
 import { COLORS, drawAnnotation } from '../utils/annotations';
 import type { Annotation, ToolId } from '../utils/annotations';
-import { LongShotStitcher } from '../utils/stitch';
-import type { StitchStatus } from '../utils/stitch';
 import type { Settings } from '../types';
-import { isTauriEnv, NativeBridge } from '../bridge/tauri';
+import { NativeBridge } from '../bridge/tauri';
 import { Sep } from './ui/Button';
+
+/** 与 Rust 侧 `long_*` 命令返回的 status 取值保持一致 */
+type StitchStatus = 'init' | 'appended' | 'nochange' | 'seam' | 'full';
 
 export interface OverlayResult {
   canvas: HTMLCanvasElement;
@@ -35,7 +36,7 @@ export interface OverlayResult {
 }
 
 interface Props {
-  desktop: Desktop;
+  desktop: ScreenFrame;
   mode: 'shot' | 'long';
   settings: Settings;
   allowLong: boolean;
@@ -82,9 +83,6 @@ const ACCENT_SOFT = 'rgba(43,108,240,0.85)';
 const TB_H = 40;
 const SUB_H = 36;
 const PANEL_W = 236;
-
-/** 原生 Tauri：长截图的抓帧 / 拼接 / 滚动代理全部在 Rust 侧完成 */
-const native = isTauriEnv();
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
@@ -176,7 +174,6 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
   const previewCanvas = useRef<HTMLCanvasElement | null>(null);
   const previewBox = useRef<HTMLDivElement | null>(null);
   const tbRef = useRef<HTMLDivElement | null>(null);
-  const stitcher = useRef<LongShotStitcher | null>(null);
   const captureTimer = useRef(0);
   const lastCapture = useRef(0);
   const pendingHint = useRef(0);
@@ -307,96 +304,61 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
   );
 
   /* ---------- 长截图 ---------- */
+  // 原生 Tauri：长截图的抓帧 / 拼接 / 滚动代理全部在 Rust 侧完成
   const drawPreview = useCallback(async () => {
     const c = previewCanvas.current;
     if (!c) return;
-    if (native) {
-      // 原生：预览图由 Rust 侧降采样后以 PNG 返回
-      const url = await NativeBridge.longPreview();
-      const img = new Image();
-      img.onload = () => {
-        const PW = PANEL_W - 32;
-        const ph = Math.max(1, Math.round((img.height / Math.max(1, img.width)) * PW));
-        c.width = Math.round(PW * dpr);
-        c.height = Math.round(ph * dpr);
-        c.style.width = `${PW}px`;
-        c.style.height = `${ph}px`;
-        c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
-        requestAnimationFrame(() => {
-          if (previewBox.current) previewBox.current.scrollTop = previewBox.current.scrollHeight;
-        });
-      };
-      img.src = url;
-      return;
-    }
-    const st = stitcher.current;
-    if (!st || !st.source || st.height === 0) return;
-    const PW = PANEL_W - 32;
-    const ph = Math.max(1, Math.round(st.height * (PW / st.width)));
-    c.width = Math.round(PW * dpr);
-    c.height = Math.round(ph * dpr);
-    c.style.width = `${PW}px`;
-    c.style.height = `${ph}px`;
-    c.getContext('2d')!.drawImage(st.source, 0, 0, st.width, st.height, 0, 0, c.width, c.height);
-    requestAnimationFrame(() => {
-      if (previewBox.current) previewBox.current.scrollTop = previewBox.current.scrollHeight;
-    });
+    // 预览图由 Rust 侧降采样后以 PNG 返回
+    const url = await NativeBridge.longPreview();
+    const img = new Image();
+    img.onload = () => {
+      const PW = PANEL_W - 32;
+      const ph = Math.max(1, Math.round((img.height / Math.max(1, img.width)) * PW));
+      c.width = Math.round(PW * dpr);
+      c.height = Math.round(ph * dpr);
+      c.style.width = `${PW}px`;
+      c.style.height = `${ph}px`;
+      c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
+      requestAnimationFrame(() => {
+        if (previewBox.current) previewBox.current.scrollTop = previewBox.current.scrollHeight;
+      });
+    };
+    img.src = url;
   }, [dpr]);
 
   const captureFrame = useCallback(async () => {
     const r = selRef.current;
     if (!r) return;
     lastCapture.current = performance.now();
-    if (native) {
-      try {
-        const st = await NativeBridge.longPush(pendingHint.current);
-        if (st.status !== 'nochange') pendingHint.current = 0;
-        const status = st.status === 'nochange' ? 'bottom' : st.status;
-        // 到底后自动滚动也停下来
-        setLong((l) => ({ ...l, frames: st.frames, w: st.width, h: st.height, status, auto: status === 'bottom' ? false : l.auto }));
-        await drawPreview();
-      } catch {
-        /* 会话已结束等竞态，忽略 */
-      }
-      return;
+    try {
+      const st = await NativeBridge.longPush(pendingHint.current);
+      if (st.status !== 'nochange') pendingHint.current = 0;
+      const status = st.status === 'nochange' ? 'bottom' : st.status;
+      // 到底后自动滚动也停下来
+      setLong((l) => ({ ...l, frames: st.frames, w: st.width, h: st.height, status, auto: status === 'bottom' ? false : l.auto }));
+      await drawPreview();
+    } catch {
+      /* 会话已结束等竞态，忽略 */
     }
-    const st = stitcher.current;
-    if (!st) return;
-    const status = st.push(desktop.captureRegion(r), pendingHint.current);
-    if (status !== 'nochange') pendingHint.current = 0;
-    setLong((l) => ({ ...l, frames: st.frames, w: st.width, h: st.height, status: status === 'nochange' ? 'bottom' : status }));
-    drawPreview();
-  }, [native, desktop, drawPreview]);
+  }, [drawPreview]);
 
   const scrollAndCapture = useCallback(
     async (dy: number): Promise<boolean> => {
       const r = selRef.current;
       if (!r) return false;
-      if (native) {
-        // 把滚轮代理给选区下方的真实窗口，再抓一帧推进 Rust 拼接器
-        const moved = await NativeBridge.scrollRegion(r.x + r.w / 2, r.y + r.h / 2, dy);
-        if (moved <= 0) {
-          setLong((l) => ({ ...l, status: 'noscroll', auto: false }));
-          return false;
-        }
-        pendingHint.current += moved * dpr;
-        window.clearTimeout(captureTimer.current);
-        if (performance.now() - lastCapture.current > 60) await captureFrame();
-        else captureTimer.current = window.setTimeout(() => void captureFrame(), 120);
-        return true;
-      }
-      const moved = desktop.scrollBy(dy);
-      if (Math.abs(moved) < 0.5) {
-        setLong((l) => ({ ...l, status: l.status === 'noscroll' ? 'noscroll' : 'bottom' }));
+      // 把滚轮代理给选区下方的真实窗口，再抓一帧推进 Rust 拼接器
+      const moved = await NativeBridge.scrollRegion(r.x + r.w / 2, r.y + r.h / 2, dy);
+      if (moved <= 0) {
+        setLong((l) => ({ ...l, status: 'noscroll', auto: false }));
         return false;
       }
       pendingHint.current += moved * dpr;
       window.clearTimeout(captureTimer.current);
-      if (performance.now() - lastCapture.current > 50) captureFrame();
-      else captureTimer.current = window.setTimeout(captureFrame, 70);
+      if (performance.now() - lastCapture.current > 60) await captureFrame();
+      else captureTimer.current = window.setTimeout(() => void captureFrame(), 120);
       return true;
     },
-    [native, desktop, dpr, captureFrame]
+    [dpr, captureFrame]
   );
 
   const enterLong = useCallback(
@@ -408,30 +370,21 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       setTool(null);
       setTextEdit(null);
       pendingHint.current = 0;
-      if (native) {
-        const epoch = ++longEpoch.current;
-        void (async () => {
-          try {
-            const st = await NativeBridge.longBegin(r);
-            if (epoch !== longEpoch.current) return;
-            // 把选区擦成透明：用户看到实时滚动内容，抓帧也不会拍到自己的遮罩
-            desktop.setEraseRect(r);
-            setLong({ frames: st.frames, w: st.width, h: st.height, status: 'init', auto: settings.longAutoStart });
-            setPhase('long');
-          } catch (err) {
-            onToast(`长截图启动失败：${String(err)}`);
-          }
-        })();
-        return;
-      }
-      const st = new LongShotStitcher();
-      stitcher.current = st;
-      st.push(desktop.captureRegion(r), 0);
-      const scrollable = desktop.isScrollable(r);
-      setLong({ frames: 1, w: st.width, h: st.height, status: scrollable ? 'init' : 'noscroll', auto: scrollable && settings.longAutoStart });
-      setPhase('long');
+      const epoch = ++longEpoch.current;
+      void (async () => {
+        try {
+          const st = await NativeBridge.longBegin(r);
+          if (epoch !== longEpoch.current) return;
+          // 把选区擦成透明：用户看到实时滚动内容，抓帧也不会拍到自己的遮罩
+          desktop.setEraseRect(r);
+          setLong({ frames: st.frames, w: st.width, h: st.height, status: 'init', auto: settings.longAutoStart });
+          setPhase('long');
+        } catch (err) {
+          onToast(`长截图启动失败：${String(err)}`);
+        }
+      })();
     },
-    [native, allowLong, desktop, onToast, settings.longAutoStart]
+    [allowLong, desktop, onToast, settings.longAutoStart]
   );
 
   useEffect(() => {
@@ -441,36 +394,26 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
   const cancelLong = useCallback(() => {
     longEpoch.current++;
     window.clearTimeout(captureTimer.current);
-    stitcher.current = null;
-    if (native) {
-      void NativeBridge.longCancel();
-      desktop.setEraseRect(null);
-    }
+    void NativeBridge.longCancel();
+    desktop.setEraseRect(null);
     setLong({ frames: 0, w: 0, h: 0, status: 'init', auto: false });
     setPhase('selected');
-  }, [native, desktop]);
+  }, [desktop]);
 
   const finishLong = useCallback(() => {
     longEpoch.current++;
     window.clearTimeout(captureTimer.current);
-    if (native) {
-      void (async () => {
-        try {
-          const canvas = await NativeBridge.longFinish();
-          desktop.setEraseRect(null);
-          onResult({ canvas, kind: 'long', action: 'done' });
-          onClose();
-        } catch (err) {
-          onToast(`导出长图失败：${String(err)}`);
-        }
-      })();
-      return;
-    }
-    const st = stitcher.current;
-    if (!st) return;
-    onResult({ canvas: st.output(), kind: 'long', action: 'done' });
-    onClose();
-  }, [native, desktop, onResult, onClose, onToast]);
+    void (async () => {
+      try {
+        const canvas = await NativeBridge.longFinish();
+        desktop.setEraseRect(null);
+        onResult({ canvas, kind: 'long', action: 'done' });
+        onClose();
+      } catch (err) {
+        onToast(`导出长图失败：${String(err)}`);
+      }
+    })();
+  }, [desktop, onResult, onClose, onToast]);
 
   // 自动滚动
   useEffect(() => {

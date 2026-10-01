@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Settings2, Crop, ScrollText, Keyboard, Info, X, Minus, Monitor, Pin } from 'lucide-react';
+import { Settings2, Crop, ScrollText, Keyboard, Info, X, Minus, Pin } from 'lucide-react';
 import type { Settings, Hotkeys } from '../types';
 import { comboFromEvent, hotkeyCapture } from '../utils/hotkey';
 import { viewportCss } from '../bridge/tauri';
@@ -12,7 +12,6 @@ interface Props {
   onClose: () => void;
   onShot: () => void;
   onLong: () => void;
-  onRealShot: () => void;
 }
 
 type Tab = 'general' | 'shot' | 'long' | 'keys' | 'about';
@@ -118,7 +117,7 @@ const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void }> = 
   );
 };
 
-export function MainWindow({ settings, onChange, onClose, onShot, onLong, onRealShot }: Props) {
+export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Props) {
   const [tab, setTab] = useState<Tab>('general');
   const [autoStart, setAutoStart] = useState(true);
   const WIN_W = 820;
@@ -298,15 +297,6 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong, onReal
                 </div>
               </div>
 
-              <Row title="截取真实屏幕" desc="通过浏览器屏幕共享授权截取你的真实屏幕画面（仅普通截图，网页环境限制）">
-                <button
-                  type="button"
-                  onClick={onRealShot}
-                  className="h-7 px-3 rounded-md border border-stroke-strong bg-card hover:bg-card-hover text-[12px] text-fg flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Monitor size={13} /> 选择屏幕
-                </button>
-              </Row>
               <Row title="截图完成后自动复制到剪贴板" desc="点击「完成」或双击选区时，把结果写入剪贴板">
                 <Toggle on={settings.autoCopy} onChange={(v) => set('autoCopy', v)} />
               </Row>

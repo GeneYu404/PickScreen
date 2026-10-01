@@ -1,5 +1,7 @@
-import type { Rect } from '../sim/desktop';
-import { UI_FONT } from '../sim/desktop';
+import type { Rect } from '../bridge/desktop';
+
+/** 标注绘制用的字体栈（画在截图帧上，需与界面字体一致） */
+const UI_FONT = '"Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif';
 
 export type ToolId = 'rect' | 'ellipse' | 'arrow' | 'pen' | 'marker' | 'text' | 'number' | 'mosaic';
 

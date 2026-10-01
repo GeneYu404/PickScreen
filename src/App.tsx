@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Crop, ScrollText, Settings2, Info, Power, Pin } from 'lucide-react';
-import { Desktop } from './sim/desktop';
+import { ScreenFrame } from './bridge/desktop';
+import type { DetectRegion } from './bridge/desktop';
 import { ScreenshotOverlay } from './components/ScreenshotOverlay';
 import type { OverlayResult } from './components/ScreenshotOverlay';
 import { MainWindow, AppLogo } from './components/MainWindow';
 import { ResultWindow, copyDataUrl, downloadDataUrl } from './components/ResultWindow';
-import { captureScreen } from './utils/capture';
 import { DEFAULT_SETTINGS } from './types';
 import type { Settings, ResultItem } from './types';
 import { APP_NAME, APP_VERSION } from './brand';
@@ -19,15 +19,14 @@ const native = isTauriEnv();
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [desktop, setDesktop] = useState<Desktop | null>(null);
-  const [, bump] = useReducer((x: number) => x + 1, 0);
+  const [desktop, setDesktop] = useState<ScreenFrame | null>(null);
 
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   // 原生模式启动不弹面板：纯托盘常驻，靠全局热键 / 托盘菜单唤起。
   // 浏览器原型没有托盘，仍保持开箱即见，避免开发调试要多点一次桌面图标。
   const [showMain, setShowMain] = useState(!native);
   const [trayMenu, setTrayMenu] = useState(false);
-  const [overlay, setOverlay] = useState<{ mode: 'shot' | 'long'; real: boolean } | null>(null);
+  const [overlay, setOverlay] = useState<{ mode: 'shot' | 'long' } | null>(null);
   const [results, setResults] = useState<ResultItem[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef(0);
@@ -90,13 +89,11 @@ export function App() {
   /* ---------- 初始化桌面（原生模式：不绘制模拟桌面，画布保持透明） ---------- */
   useEffect(() => {
     if (!canvasRef.current) return;
-    const d = new Desktop(canvasRef.current);
-    d.native = native;
+    const d = new ScreenFrame(canvasRef.current);
     setDesktop(d);
     const onResize = () => {
       d.resize();
       setOverlay(null);
-      bump();
     };
     window.addEventListener('resize', onResize);
     const clock = window.setInterval(() => d.requestRender(), 30000);
@@ -112,14 +109,16 @@ export function App() {
       if (overlay || hotkeyCapture.active) return;
       setShowMain(false);
       setTrayMenu(false);
-      setOverlay({ mode, real: false });
+      setOverlay({ mode });
       if (!native) return;
       void (async () => {
         try {
           const bmp = await NativeBridge.grabScreen();
           if (!desktop) return;
           desktop.setEraseRect(null);
-          desktop.nativeWindows = (await NativeBridge.listWindows()).map((w) => ({ ...w, name: w.title }));
+          desktop.setWindows(
+            (await NativeBridge.listWindows()).map<DetectRegion>((w) => ({ x: w.x, y: w.y, w: w.w, h: w.h, name: w.title }))
+          );
           desktop.setScreenImage(bmp);
         } catch (err) {
           setOverlay(null);
@@ -131,33 +130,10 @@ export function App() {
     [overlay, desktop, showToast]
   );
 
-  /* ---------- 浏览器环境：通过屏幕共享 API 截取 ---------- */
-  const startRealShot = useCallback(async () => {
-    if (native) {
-      startOverlay('shot');
-      return;
-    }
-    if (!desktop) return;
-    try {
-      const { dataUrl } = await captureScreen();
-      const img = new Image();
-      img.onload = () => {
-        desktop.setScreenImage(img);
-        setShowMain(false);
-        setTrayMenu(false);
-        setOverlay({ mode: 'shot', real: true });
-      };
-      img.src = dataUrl;
-    } catch (err) {
-      const e = err as { name?: string; message?: string };
-      if (e?.name !== 'NotAllowedError') showToast(e?.message || '屏幕捕获已取消');
-    }
-  }, [native, startOverlay, desktop, showToast]);
-
   const closeOverlay = useCallback(() => {
     desktop?.setEraseRect(null);
     desktop?.setScreenImage(null);
-    if (desktop) desktop.nativeWindows = null;
+    if (desktop) desktop.setWindows([]);
     setOverlay(null);
     // 恢复面板：覆盖层是临时模式，关闭后不能让应用只剩托盘（取消/保存/复制路径都只有一条 toast）
     setShowMain(true);
@@ -279,10 +255,6 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [native, overlay, startOverlay, pinLast, settings.hotkeys]);
 
-  const L = desktop?.layout();
-  const showSim = !native;
-  const canvasVisible = showSim || !!overlay;
-
   /* ---------- 空闲时隐藏整块窗口 ----------
      这块 webview 覆盖整个虚拟桌面（Rust cover_virtual_desktop），
      但只有「有东西要渲染」时才需要可见：配置面板 / 截图覆盖层 / 贴图。
@@ -297,56 +269,18 @@ export function App() {
 
   return (
     <div
-      className={`fixed inset-0 overflow-hidden select-none ${showSim ? 'bg-[var(--desktop)]' : ''}`}
+      className="fixed inset-0 overflow-hidden select-none"
       onMouseDown={() => setTrayMenu(false)}
     >
       {/* 桌面 / 真实屏幕抓帧画布（原生空闲态隐藏，让窗口对鼠标完全穿透） */}
-      <canvas ref={canvasRef} className="absolute left-0 top-0 block" style={{ display: canvasVisible ? 'block' : 'none' }} />
-
-      {/* 桌面热区：应用图标（双击打开）、托盘图标（仅浏览器原型；原生使用真实托盘） */}
-      {showSim && L && !overlay && (
-        <>
-          <button
-            type="button"
-            className="absolute rounded hover:bg-white/25 transition-colors cursor-default"
-            style={{ left: L.iconApp.x, top: L.iconApp.y - 4, width: L.iconApp.w, height: L.iconApp.h }}
-            onDoubleClick={() => setShowMain(true)}
-            title={`双击打开${APP_NAME}`}
-          />
-          <button
-            type="button"
-            className={`absolute rounded transition-colors cursor-default ${trayMenu ? 'bg-black/10' : 'hover:bg-black/8'}`}
-            style={{ left: L.trayIcon.x - 4, top: L.trayIcon.y - 6, width: L.trayIcon.w + 8, height: L.trayIcon.h + 12 }}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => setTrayMenu((v) => !v)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setTrayMenu((v) => !v);
-            }}
-            title={APP_NAME}
-          />
-          {L.centerIcons.map((r, i) => (
-            <button
-              key={i}
-              type="button"
-              className="absolute rounded-md hover:bg-black/6 transition-colors cursor-default"
-              style={{ left: r.x, top: r.y, width: r.w, height: r.h }}
-              onClick={() => showToast(`预览模式：仅${APP_NAME}可用`)}
-            />
-          ))}
-        </>
-      )}
+      <canvas ref={canvasRef} className="absolute left-0 top-0 block" style={{ display: overlay ? 'block' : 'none' }} />
 
       {/* 托盘菜单（原生由真实托盘图标事件唤起） */}
-      {L && trayMenu && !overlay && (
+      {desktop && trayMenu && !overlay && (
         <div
           className="absolute z-50 w-[200px] bg-acrylic backdrop-blur rounded-lg border border-stroke shadow-flyout animate-menu-in py-1.5 text-[13px] text-fg"
           data-region="tray"
-          style={
-            showSim
-              ? { right: L.W - (L.trayIcon.x + L.trayIcon.w) - 6, bottom: L.taskbar.h + 10 }
-              : { right: 16, bottom: 64 }
-          }
+          style={{ right: 16, bottom: 64 }}
           onMouseDown={(e) => e.stopPropagation()}
         >
           <div className="px-3 py-1.5 flex items-center gap-2 text-[12px] text-fg2">
@@ -390,7 +324,7 @@ export function App() {
             type="button"
             onClick={() => {
               setTrayMenu(false);
-              showToast(`预览模式无法退出${APP_NAME}`);
+              showToast(`请右键托盘图标退出${APP_NAME}`);
             }}
             className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
           >
@@ -413,7 +347,6 @@ export function App() {
           onClose={() => setShowMain(false)}
           onShot={() => startOverlay('shot')}
           onLong={() => startOverlay('long')}
-          onRealShot={startRealShot}
         />
       )}
 
@@ -423,7 +356,7 @@ export function App() {
           desktop={desktop}
           mode={overlay.mode}
           settings={settings}
-          allowLong={!overlay.real}
+          allowLong={true}
           onClose={closeOverlay}
           onResult={handleResult}
           onToast={showToast}
