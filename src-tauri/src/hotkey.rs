@@ -17,8 +17,7 @@ pub const ACT_PIN: u8 = 3;
 
 /// 三组热键的当前配置 + 已注册清单
 pub struct HotkeyCtl {
-    /// (动作 id, 组合键字符串, 该动作是否启用)
-    combos: Mutex<Vec<(u8, String, bool)>>,
+    combos: Mutex<Vec<(u8, String)>>,
     /// 总开关：关掉时三组热键全部注销（设置面板 / 托盘菜单仍可用）
     enabled: AtomicBool,
     paused: AtomicBool,
@@ -30,9 +29,9 @@ impl HotkeyCtl {
         Self {
             // 与前端 DEFAULT_SETTINGS 保持一致，前端加载配置后会覆盖
             combos: Mutex::new(vec![
-                (ACT_SHOT, "Ctrl+1".into(), true),
-                (ACT_LONG, "Ctrl+3".into(), true),
-                (ACT_PIN, "Ctrl+2".into(), true),
+                (ACT_SHOT, "Ctrl+1".into()),
+                (ACT_LONG, "Ctrl+3".into()),
+                (ACT_PIN, "Ctrl+2".into()),
             ]),
             enabled: AtomicBool::new(true),
             paused: AtomicBool::new(false),
@@ -64,11 +63,11 @@ impl HotkeyCtl {
         self.registered.lock().unwrap().push((sc, id));
     }
 
-    pub(super) fn combos(&self) -> Vec<(u8, String, bool)> {
+    pub(super) fn combos(&self) -> Vec<(u8, String)> {
         self.combos.lock().unwrap().clone()
     }
 
-    pub(super) fn set_combos(&self, combos: Vec<(u8, String, bool)>) {
+    pub(super) fn set_combos(&self, combos: Vec<(u8, String)>) {
         *self.combos.lock().unwrap() = combos;
     }
 
@@ -171,11 +170,7 @@ pub fn apply(app: &tauri::AppHandle) -> Result<(), String> {
     if st.hotkey.is_paused() || !st.hotkey.is_enabled() {
         return Ok(());
     }
-    for (id, combo, action_on) in st.hotkey.combos() {
-        // 单个动作的独立开关：关掉则该组不注册，其余两组不受影响
-        if !action_on {
-            continue;
-        }
+    for (id, combo) in st.hotkey.combos() {
         if let Some(sc) = parse_combo(&combo) {
             // 失败 = 组合键被其它程序占用，忽略（与常见截图工具行为一致）
             if gs.register(sc).is_ok() {
@@ -186,24 +181,18 @@ pub fn apply(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 同步新的热键配置 + 总开关 + 三个动作的独立开关
+/// 同步新的热键配置 + 总开关
 pub fn sync(
     app: &tauri::AppHandle,
     shot: String,
     long: String,
     pin: String,
-    shot_enabled: bool,
-    long_enabled: bool,
-    pin_enabled: bool,
     enabled: bool,
 ) -> Result<(), String> {
     use tauri::Manager;
     let st = app.state::<crate::state::SharedState>();
-    st.hotkey.set_combos(vec![
-        (ACT_SHOT, shot, shot_enabled),
-        (ACT_LONG, long, long_enabled),
-        (ACT_PIN, pin, pin_enabled),
-    ]);
+    st.hotkey
+        .set_combos(vec![(ACT_SHOT, shot), (ACT_LONG, long), (ACT_PIN, pin)]);
     st.hotkey.set_enabled_flag(enabled);
     apply(app)
 }

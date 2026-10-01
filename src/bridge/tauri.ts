@@ -169,9 +169,6 @@ export const NativeBridge = {
       shot: hotkeys.shot,
       long: hotkeys.long,
       pin: hotkeys.pin,
-      shotEnabled: hotkeys.shotEnabled,
-      longEnabled: hotkeys.longEnabled,
-      pinEnabled: hotkeys.pinEnabled,
       enabled,
     });
   },

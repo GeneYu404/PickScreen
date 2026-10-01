@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Settings2, Crop, ScrollText, Keyboard, Info, X, Minus, Pin } from 'lucide-react';
-import type { Settings, Hotkeys } from '../types';
+import type { Settings, Hotkeys, OverlayAction } from '../types';
 import { comboFromEvent, hotkeyCapture } from '../utils/hotkey';
 import { viewportCss, NativeBridge } from '../bridge/tauri';
 import { APP_NAME, APP_NAME_EN, APP_VERSION } from '../brand';
@@ -53,6 +53,19 @@ const Row: React.FC<{ title: string; desc?: string; children: React.ReactNode }>
     </div>
     {children}
   </div>
+);
+
+/** 行末「清除」：把该行快捷键置空 = 不绑定任何按键 */
+const ClearButton: React.FC<{ label: string; combo: string; onClear: () => void }> = ({ label, combo, onClear }) => (
+  <button
+    type="button"
+    disabled={!combo}
+    onClick={onClear}
+    title={combo ? `清除「${label}」的快捷键（置为未设置，不再绑定）` : '该行已是未设置'}
+    className="h-6 rounded px-2 text-[11.5px] text-fg2 transition-colors hover:bg-subtle hover:text-fg disabled:pointer-events-none disabled:opacity-30 cursor-pointer"
+  >
+    清除
+  </button>
 );
 
 /** 组合键展示：Ctrl + 1 拆成两个键帽 */
@@ -206,14 +219,12 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
     onChange({ ...settings, hotkeys: next });
   };
 
-  /** 开启 / 关闭单个动作的全局快捷键（总开关之外，组内独立） */
-  const toggleHotkeyEnabled = (field: 'shot' | 'long' | 'pin') => {
-    const key = `${field}Enabled` as const;
-    onChange({ ...settings, hotkeys: { ...settings.hotkeys, [key]: !settings.hotkeys[key] } });
+  /** 修改覆盖层内的动作键（截图界面用），支持清空 */
+  const changeOverlayKey = (action: OverlayAction, combo: string) => {
+    onChange({ ...settings, overlayKeys: { ...settings.overlayKeys, [action]: combo } });
   };
 
-  /**
-   * 开机自启动：真正写入 HKCU\...\CurrentVersion\Run（官方插件）。
+  /** 开启 / 关闭开机自启动：真正写入 HKCU\...\CurrentVersion\Run（官方插件）。
    * 失败时把设置回滚，避免 UI 显示「已开启」而系统里其实没有。
    */
   const toggleAutoStart = async () => {
@@ -437,17 +448,14 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                 <Toggle on={settings.hotkeysEnabled} onChange={(v) => set('hotkeysEnabled', v)} />
               </Row>
               <div className="bg-accent-soft border border-stroke rounded-lg px-4 py-2.5 text-[12px] text-fg2">
-                点击组合键方框后直接按下新的组合键即可修改，<b>Backspace</b> 清除、<b>Esc</b> 取消；
-                也可以直接点行末的「清除」把该组置为未设置（等于不注册到系统）。
-                若与其它动作冲突，两个动作会自动交换。
-                每组可用「启用」列单独开关；<b>总开关</b>关闭时三组都不注册。
-                {!settings.hotkeysEnabled && <b className="text-fg"> 当前总开关已关闭，组合键不会注册到系统。</b>}
+                两组表格里的按键都能改：点方框后直接按下新组合键，<b>Backspace</b> 清除、<b>Esc</b> 取消；
+                也可以点行末「清除」直接置为未设置（等于不绑定）。全局热键若与其它动作冲突会自动交换。
+                {!settings.hotkeysEnabled && <b className="text-fg"> 当前总开关已关闭，三组全局热键都不会注册到系统。</b>}
               </div>
               <div className="bg-card border border-stroke rounded-lg overflow-hidden">
                 <table className="w-full text-[12.5px]">
                   <thead>
                     <tr className="bg-layer text-left text-fg2">
-                      <th className="font-medium px-4 py-2.5">启用</th>
                       <th className="font-medium px-4 py-2.5">动作</th>
                       <th className="font-medium px-4 py-2.5">快捷键</th>
                       <th className="font-medium px-4 py-2.5">范围</th>
@@ -461,53 +469,66 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                       ['pin', '贴图（最近一次截图）', settings.hotkeys.pin],
                     ] as const).map(([field, label, combo]) => (
                       <tr key={field} className="border-t border-stroke">
-                        <td className="px-4 py-2.5">
-                          <Toggle
-                            on={settings.hotkeys[`${field}Enabled`]}
-                            disabled={!settings.hotkeysEnabled}
-                            onChange={() => toggleHotkeyEnabled(field)}
-                          />
-                        </td>
                         <td className="px-4 py-2.5">{label}</td>
                         <td className="px-4 py-2.5">
                           <HotkeyField
                             value={combo}
                             onChange={(v) => changeHotkey(field, v)}
-                            disabled={!settings.hotkeysEnabled || !settings.hotkeys[`${field}Enabled`]}
+                            disabled={!settings.hotkeysEnabled}
                           />
                         </td>
                         <td className="px-4 py-2.5 text-fg3">全局</td>
                         <td className="px-4 py-2.5 text-right">
-                          <button
-                            type="button"
-                            disabled={!combo}
-                            onClick={() => changeHotkey(field, '')}
-                            title={combo ? `清除「${label}」的快捷键（置为未设置，不再注册到系统）` : '该组已是未设置'}
-                            className="h-6 rounded px-2 text-[11.5px] text-fg2 transition-colors hover:bg-subtle hover:text-fg disabled:pointer-events-none disabled:opacity-30 cursor-pointer"
-                          >
-                            清除
-                          </button>
+                          <ClearButton label={label} combo={combo} onClear={() => changeHotkey(field, '')} />
                         </td>
                       </tr>
                     ))}
-                    {[
-                      ['完成（复制并关闭）', ['Enter', '双击选区'], '截图界面'],
-                      ['取消 / 退出工具', ['Esc', '右键'], '截图界面'],
-                      ['撤销 / 重做', ['Ctrl + Z', 'Ctrl + Y'], '截图界面'],
-                      ['复制 / 保存', ['Ctrl + C', 'Ctrl + S'], '截图界面'],
-                      ['复制当前颜色', ['C'], '框选前'],
-                      ['长截图：完成 / 停止', ['Enter', 'Esc'], '长截图模式'],
-                      ['贴图：关闭', ['点 ✕ 按钮'], '贴图窗口'],
-                      ['贴图：缩放 / 移动', ['滚轮 / 拖动'], '贴图窗口'],
-                    ].map(([a, keys, scope]) => (
-                      <tr key={a as string} className="border-t border-stroke">
+                    {([
+                      ['done', '完成（复制并关闭）', '截图界面'],
+                      ['cancel', '取消 / 退出工具', '截图界面'],
+                      ['undo', '撤销', '截图界面'],
+                      ['redo', '重做', '截图界面'],
+                      ['copy', '复制结果到剪贴板', '截图界面'],
+                      ['save', '保存为文件', '截图界面'],
+                      ['pickColor', '复制当前颜色', '框选前'],
+                    ] as [OverlayAction, string, string][]).map(([action, label, scope]) => (
+                      <tr key={action} className="border-t border-stroke">
+                        <td className="px-4 py-2.5">{label}</td>
+                        <td className="px-4 py-2.5">
+                          <HotkeyField
+                            value={settings.overlayKeys[action]}
+                            onChange={(v) => changeOverlayKey(action, v)}
+                          />
+                        </td>
+                        <td className="px-4 py-2.5 text-fg3">{scope}</td>
+                        <td className="px-4 py-2.5 text-right">
+                          <ClearButton
+                            label={label}
+                            combo={settings.overlayKeys[action]}
+                            onClear={() => changeOverlayKey(action, '')}
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                    {/* 以下不是按键绑定，无法自定义，保持说明性质 */}
+                    {(
+                      [
+                        ['长截图：完成 / 停止', ['同上「完成 / 取消」'], '长截图模式'],
+                        ['完成（另一入口）', ['双击选区'], '截图界面'],
+                        ['取消（另一入口）', ['右键'], '截图界面'],
+                        ['贴图：关闭', ['点 ✕ 按钮'], '贴图窗口'],
+                        ['贴图：缩放 / 移动', ['滚轮 / 拖动'], '贴图窗口'],
+                      ] as [string, string[], string][]
+                    ).map(([a, keys, scope]) => (
+                      <tr key={a} className="border-t border-stroke">
                         <td className="px-4 py-2.5">{a}</td>
                         <td className="px-4 py-2.5 space-x-1.5">
-                          {(keys as string[]).map((k) => (
+                          {keys.map((k) => (
                             <Kbd key={k}>{k}</Kbd>
                           ))}
                         </td>
                         <td className="px-4 py-2.5 text-fg3">{scope}</td>
+                        <td className="px-4 py-2.5" />
                       </tr>
                     ))}
                   </tbody>

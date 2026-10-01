@@ -5,17 +5,18 @@ export interface Hotkeys {
   long: string;
   /** 贴图（把最近一次截图钉在屏幕上） */
   pin: string;
-  /** 各动作是否注册到系统（与总开关 hotkeysEnabled 叠加，任一为假即不注册） */
-  shotEnabled: boolean;
-  longEnabled: boolean;
-  pinEnabled: boolean;
 }
+
+/** 截图覆盖层内可自定义的动作键（全局热键之外） */
+export type OverlayAction = 'done' | 'cancel' | 'undo' | 'redo' | 'copy' | 'save' | 'pickColor';
 
 export interface Settings {
   /** 全局快捷键，可在设置中修改 */
   hotkeys: Hotkeys;
   /** 全局快捷键总开关：关掉后三组热键全部注销（托盘菜单与配置面板不受影响） */
   hotkeysEnabled: boolean;
+  /** 截图覆盖层内的动作键（Enter / Esc / Ctrl+Z …），同样可改键与清空 */
+  overlayKeys: Record<OverlayAction, string>;
   /** 完成后自动复制到剪贴板 */
   autoCopy: boolean;
   /** 鼠标移动时自动识别窗口 */
@@ -39,8 +40,17 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2', shotEnabled: true, longEnabled: true, pinEnabled: true },
+  hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2' },
   hotkeysEnabled: true,
+  overlayKeys: {
+    done: 'Enter',
+    cancel: 'Esc',
+    undo: 'Ctrl+Z',
+    redo: 'Ctrl+Y',
+    copy: 'Ctrl+C',
+    save: 'Ctrl+S',
+    pickColor: 'C',
+  },
   autoStart: false,
   captureSelf: false,
   autoCopy: true,

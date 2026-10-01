@@ -169,21 +169,9 @@ fn sync_hotkeys(
     shot: String,
     long: String,
     pin: String,
-    shot_enabled: bool,
-    long_enabled: bool,
-    pin_enabled: bool,
     enabled: bool,
 ) -> Result<(), String> {
-    hotkey::sync(
-        &app,
-        shot,
-        long,
-        pin,
-        shot_enabled,
-        long_enabled,
-        pin_enabled,
-        enabled,
-    )
+    hotkey::sync(&app, shot, long, pin, enabled)
 }
 
 /// 录制快捷键时挂起系统级热键（插件 unregister_all 语义）

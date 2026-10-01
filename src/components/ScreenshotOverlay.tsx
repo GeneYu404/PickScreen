@@ -22,7 +22,8 @@ import type { LucideIcon } from 'lucide-react';
 import type { ScreenFrame, Rect, DetectRegion } from '../bridge/desktop';
 import { COLORS, drawAnnotation } from '../utils/annotations';
 import type { Annotation, ToolId } from '../utils/annotations';
-import type { Settings } from '../types';
+import type { Settings, OverlayAction } from '../types';
+import { comboMatches } from '../utils/hotkey';
 import { NativeBridge } from '../bridge/tauri';
 import { Sep } from './ui/Button';
 
@@ -431,6 +432,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
 
   /* ---------- 键盘 ---------- */
   useEffect(() => {
+    const ok = settings.overlayKeys;
     const onKey = (e: KeyboardEvent) => {
       if (textEdit) {
         if (e.key === 'Escape') {
@@ -439,29 +441,30 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
         }
         return;
       }
-      const k = e.key.toLowerCase();
-      const ctrl = e.ctrlKey || e.metaKey;
-      if (e.key === 'Escape') {
+      // 键位全部可在设置里改，这里按配置查表而不是写死
+      const hit = (a: OverlayAction) => comboMatches(e, ok[a]);
+      if (hit('cancel')) {
         e.preventDefault();
         if (phase === 'long') cancelLong();
         else onClose();
-      } else if (e.key === 'Enter') {
+      } else if (hit('done')) {
         e.preventDefault();
         if (phase === 'long') finishLong();
         else if (phase === 'selected') finish('done');
-      } else if (ctrl && k === 'z') {
+      } else if (hit('undo')) {
         e.preventDefault();
         undo();
-      } else if (ctrl && k === 'y') {
+      } else if (hit('redo')) {
         e.preventDefault();
         redo();
-      } else if (ctrl && k === 's' && phase === 'selected') {
+      } else if (phase === 'selected' && hit('save')) {
         e.preventDefault();
         finish('save');
-      } else if (ctrl && k === 'c' && phase === 'selected') {
+      } else if (phase === 'selected' && hit('copy')) {
         e.preventDefault();
         finish('copy');
-      } else if (!ctrl && k === 'c' && phase === 'pick') {
+      } else if (phase === 'pick' && hit('pickColor')) {
+        e.preventDefault();
         const hex = toHex(desktop.getPixel(cursor.x, cursor.y));
         navigator.clipboard?.writeText(hex).catch(() => undefined);
         onToast(`已复制颜色 ${hex}`);
@@ -469,7 +472,20 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [textEdit, phase, cancelLong, onClose, finishLong, finish, undo, redo, desktop, cursor, onToast]);
+  }, [
+    textEdit,
+    phase,
+    settings.overlayKeys,
+    cancelLong,
+    onClose,
+    finishLong,
+    finish,
+    undo,
+    redo,
+    desktop,
+    cursor,
+    onToast,
+  ]);
 
   /* ---------- 鼠标 ---------- */
   const onMouseDown = (e: React.MouseEvent) => {
