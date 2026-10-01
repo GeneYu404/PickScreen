@@ -67,7 +67,7 @@ const Combo: React.FC<{ combo: string }> = ({ combo }) =>
   );
 
 /** 可修改的快捷键：点击后按下新的组合键即可替换，Backspace 清除，Esc 取消 */
-const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void }> = ({ value, onChange }) => {
+const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void; disabled?: boolean }> = ({ value, onChange, disabled }) => {
   const [listening, setListening] = useState(false);
 
   useEffect(() => {
@@ -100,13 +100,16 @@ const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void }> = 
   return (
     <button
       type="button"
+      disabled={disabled}
       onClick={() => setListening(true)}
-      className={`h-7 min-w-[132px] px-2.5 rounded-md border text-[12px] flex items-center justify-center cursor-pointer transition-colors ${
-        listening
-          ? 'border-accent bg-accent-soft text-accent animate-pulse'
-          : 'border-stroke-strong bg-card text-fg hover:bg-card-hover'
+      className={`h-7 min-w-[132px] px-2.5 rounded-md border text-[12px] flex items-center justify-center transition-colors ${
+        disabled
+          ? 'border-stroke bg-card text-fg3 cursor-not-allowed'
+          : listening
+            ? 'border-accent bg-accent-soft text-accent animate-pulse cursor-pointer'
+            : 'border-stroke-strong bg-card text-fg hover:bg-card-hover cursor-pointer'
       }`}
-      title="点击后按下新的组合键 · Backspace 清除 · Esc 取消"
+      title={disabled ? '全局快捷键已关闭，先打开上方总开关' : '点击后按下新的组合键 · Backspace 清除 · Esc 取消'}
     >
       {listening ? (
         <span className="font-medium">请按新组合键…</span>
@@ -247,7 +250,13 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
           <div className="px-3 text-[11px] text-fg3 leading-5">
             正在托盘运行
             <br />
-            按 <Kbd>{settings.hotkeys.shot || '未设置'}</Kbd> 截图
+            {settings.hotkeysEnabled ? (
+              <>
+                按 <Kbd>{settings.hotkeys.shot || '未设置'}</Kbd> 截图
+              </>
+            ) : (
+              '全局快捷键已关闭'
+            )}
           </div>
         </div>
 
@@ -377,8 +386,12 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
 
           {tab === 'keys' && (
             <>
+              <Row title="启用全局快捷键" desc="关闭后下方三组组合键全部注销，托盘菜单与「立即截图」按钮仍可用">
+                <Toggle on={settings.hotkeysEnabled} onChange={(v) => set('hotkeysEnabled', v)} />
+              </Row>
               <div className="bg-accent-soft border border-stroke rounded-lg px-4 py-2.5 text-[12px] text-fg2">
                 点击右侧方框后直接按下新的组合键即可修改；<b>Backspace</b> 清除、<b>Esc</b> 取消。若与其它动作冲突，两个动作会自动交换。
+                {!settings.hotkeysEnabled && <b className="text-fg"> 当前总开关已关闭，组合键不会注册到系统。</b>}
               </div>
               <div className="bg-card border border-stroke rounded-lg overflow-hidden">
                 <table className="w-full text-[12.5px]">
@@ -393,21 +406,21 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                     <tr className="border-t border-stroke">
                       <td className="px-4 py-2.5">截图</td>
                       <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.shot} onChange={(v) => changeHotkey('shot', v)} />
+                        <HotkeyField value={settings.hotkeys.shot} onChange={(v) => changeHotkey('shot', v)} disabled={!settings.hotkeysEnabled} />
                       </td>
                       <td className="px-4 py-2.5 text-fg3">全局</td>
                     </tr>
                     <tr className="border-t border-stroke">
                       <td className="px-4 py-2.5">长截图</td>
                       <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.long} onChange={(v) => changeHotkey('long', v)} />
+                        <HotkeyField value={settings.hotkeys.long} onChange={(v) => changeHotkey('long', v)} disabled={!settings.hotkeysEnabled} />
                       </td>
                       <td className="px-4 py-2.5 text-fg3">全局</td>
                     </tr>
                     <tr className="border-t border-stroke">
                       <td className="px-4 py-2.5">贴图（最近一次截图）</td>
                       <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.pin} onChange={(v) => changeHotkey('pin', v)} />
+                        <HotkeyField value={settings.hotkeys.pin} onChange={(v) => changeHotkey('pin', v)} disabled={!settings.hotkeysEnabled} />
                       </td>
                       <td className="px-4 py-2.5 text-fg3">全局</td>
                     </tr>

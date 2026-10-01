@@ -132,13 +132,18 @@ Rust 已提供对应命令，不要在前端另写一套：
 2. 动了 `data-region` 属性吗？→ **不能删改**。原生鼠标穿透靠前端每 250ms 用
    `querySelectorAll('[data-region]')` 同步矩形给 Rust，丢了会导致整窗不可点或不可穿透
 3. 动了 `grab_screen` 的 hide/show 顺序吗？→ 必须**先隐藏 → 抓帧 → 再 show**，
-   顺序反了会把自己拍进去（套娃）
-4. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
+   顺序反了会把自己拍进去（套娃）。且「隐藏」要**当场生效**：tao 的 `hide()` 只是
+   `PostMessage`，必须再在 HWND 上直接 `ShowWindow`（`winapi::set_shown`），
+   并在 BitBlt 前 `DwmFlush()` 等 DWM 合成完 —— 否则抓到上一帧（覆盖层 45% 黑遮罩），
+   表现是整屏「雾蒙蒙」。详见 [后端方案.md](后端方案.md) §6.7
+4. 动过 `set_window_visible(true)` 吗？→ 必须**先写 `WS_EX_NOACTIVATE` 再 show**：
+   tao 用 `SW_SHOW` 会激活这块铺满虚拟桌面的透明 webview，用户的按键会落进来
+5. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
    内联进产物，**grep 时别只搜 `src/`**
-5. 新逻辑该写前端还是 Rust？→ 见 §6。**先问「它是否需要操作系统的知识」**，
+6. 新逻辑该写前端还是 Rust？→ 见 §6。**先问「它是否需要操作系统的知识」**，
    需要就写 Rust。前端只做纯 canvas 运算
-6. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
-7. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
+7. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
+8. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
 
 ## 8. 验证步骤
 

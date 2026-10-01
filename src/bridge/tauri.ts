@@ -163,8 +163,8 @@ async function settingsStore(): Promise<Store> {
 export const NativeBridge = {
   /* ===== 配置持久化：tauri-plugin-store（A 方案是手写 JSON 文件） ===== */
 
-  async syncHotkeys(hotkeys: Hotkeys): Promise<void> {
-    await optionalInvoke('sync_hotkeys', { shot: hotkeys.shot, long: hotkeys.long, pin: hotkeys.pin });
+  async syncHotkeys(hotkeys: Hotkeys, enabled: boolean): Promise<void> {
+    await optionalInvoke('sync_hotkeys', { shot: hotkeys.shot, long: hotkeys.long, pin: hotkeys.pin, enabled });
   },
 
   async setHotkeyPaused(paused: boolean): Promise<void> {

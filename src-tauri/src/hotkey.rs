@@ -18,6 +18,8 @@ pub const ACT_PIN: u8 = 3;
 /// 三组热键的当前配置 + 已注册清单
 pub struct HotkeyCtl {
     combos: Mutex<Vec<(u8, String)>>,
+    /// 总开关：关掉时三组热键全部注销（设置面板 / 托盘菜单仍可用）
+    enabled: AtomicBool,
     paused: AtomicBool,
     registered: Mutex<Vec<(Shortcut, u8)>>,
 }
@@ -31,9 +33,18 @@ impl HotkeyCtl {
                 (ACT_LONG, "Ctrl+3".into()),
                 (ACT_PIN, "Ctrl+2".into()),
             ]),
+            enabled: AtomicBool::new(true),
             paused: AtomicBool::new(false),
             registered: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_enabled_flag(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn is_paused(&self) -> bool {
@@ -155,7 +166,8 @@ pub fn apply(app: &tauri::AppHandle) -> Result<(), String> {
     for (sc, _) in st.hotkey.take_registered() {
         let _ = gs.unregister(sc);
     }
-    if st.hotkey.is_paused() {
+    // 总开关关闭 / 录制快捷键挂起时，一律只注销不注册
+    if st.hotkey.is_paused() || !st.hotkey.is_enabled() {
         return Ok(());
     }
     for (id, combo) in st.hotkey.combos() {
@@ -169,12 +181,19 @@ pub fn apply(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 同步新的热键配置
-pub fn sync(app: &tauri::AppHandle, shot: String, long: String, pin: String) -> Result<(), String> {
+/// 同步新的热键配置 + 总开关
+pub fn sync(
+    app: &tauri::AppHandle,
+    shot: String,
+    long: String,
+    pin: String,
+    enabled: bool,
+) -> Result<(), String> {
     use tauri::Manager;
     let st = app.state::<crate::state::SharedState>();
     st.hotkey
         .set_combos(vec![(ACT_SHOT, shot), (ACT_LONG, long), (ACT_PIN, pin)]);
+    st.hotkey.set_enabled_flag(enabled);
     apply(app)
 }
 

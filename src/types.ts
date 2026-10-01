@@ -10,6 +10,8 @@ export interface Hotkeys {
 export interface Settings {
   /** 全局快捷键，可在设置中修改 */
   hotkeys: Hotkeys;
+  /** 全局快捷键总开关：关掉后三组热键全部注销（托盘菜单与配置面板不受影响） */
+  hotkeysEnabled: boolean;
   /** 完成后自动复制到剪贴板 */
   autoCopy: boolean;
   /** 鼠标移动时自动识别窗口 */
@@ -30,6 +32,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2' },
+  hotkeysEnabled: true,
   autoCopy: true,
   detectWindows: true,
   showMagnifier: true,

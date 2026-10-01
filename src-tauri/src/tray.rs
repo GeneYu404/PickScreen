@@ -9,8 +9,10 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
     let shot = MenuItem::with_id(app, "shot", "截图", true, None::<&str>)?;
     let long = MenuItem::with_id(app, "long", "长截图", true, None::<&str>)?;
     let pin = MenuItem::with_id(app, "pin", "贴图", true, None::<&str>)?;
+    // 状态权威在设置里（随 settings.json 持久化），这里只发事件让前端翻转后回灌
+    let hotkeys = MenuItem::with_id(app, "toggle_hotkeys", "启用 / 禁用全局快捷键", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &shot, &long, &pin, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &shot, &long, &pin, &hotkeys, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("拾屏 A · Ctrl+1 截图")

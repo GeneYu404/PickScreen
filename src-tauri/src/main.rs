@@ -65,10 +65,18 @@ async fn grab_screen(app: tauri::AppHandle) -> Result<tauri::ipc::Response, Stri
         .store(true, Ordering::Relaxed);
     winapi::set_interactive(hwnd, true);
 
+    // 隐藏必须「当场生效」：tao 的 hide() 只是 PostMessage 到事件循环线程，
+    // 直接在 HWND 上再 ShowWindow 一次，保证抓帧那一刻本窗口已经不在屏幕上。
     win.hide().map_err(|e| e.to_string())?;
+    winapi::set_shown(hwnd, false);
+
     let bytes = tauri::async_runtime::spawn_blocking(|| {
-        // 给 DWM 一帧时间完成隐藏态的合成
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // 等 DWM 把这一帧合成完再抓。少了这一步：刚打断上一次截图（Esc/右键）就再按热键，
+        // 屏幕上还留着上一帧的 45% 黑遮罩，BitBlt 把它一起拍进来 → 整屏发灰。
+        winapi::flush_composition();
+        // 兜底：等 WebView2 的 DirectComposition 表面彻底交还
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        winapi::flush_composition();
         capture::grab_virtual()
     })
     .await
@@ -105,21 +113,38 @@ fn end_overlay(app: tauri::AppHandle) {
     }
 }
 
-/// 窗口整体显隐：空闲（无面板 / 无覆盖层 / 无贴图）时前端调 hide，
+/// 窗口整体显隐：空闲（无面板 / 无覆盖层 / 无贴图 / 无提示条）时前端调 hide，
 /// 让托盘常驻期间不占用顶层窗口位，穿透轮询线程也随之休眠。
 #[tauri::command]
 fn set_window_visible(app: tauri::AppHandle, visible: bool) {
     let Ok(win) = main_window(&app) else { return };
-    let res = if visible { win.show() } else { win.hide() };
+    let res = if visible {
+        // 先把空闲态样式（穿透 + WS_EX_NOACTIVATE）钉好再 show：tao 用的是 SW_SHOW，
+        // 会顺手激活窗口，而这块 webview 铺满整块虚拟桌面 —— 抢到前台后用户的按键
+        // 会落进透明窗口（例如截图后的「已复制」提示停留的 2.6s）。
+        // NOACTIVATE 必须在 ShowWindow 之前写好，事后补写已经来不及。
+        if let Ok(h) = hwnd_of(&win) {
+            winapi::set_interactive(h, false);
+        }
+        win.show()
+    } else {
+        win.hide()
+    };
     if let Err(e) = res {
         eprintln!("[window] 设置显隐失败 (visible={visible}): {e}");
     }
 }
 
-/// 同步全局热键（委托给 tauri-plugin-global-shortcut 重新注册）
+/// 同步全局热键与总开关（委托给 tauri-plugin-global-shortcut 重新注册）
 #[tauri::command]
-fn sync_hotkeys(app: tauri::AppHandle, shot: String, long: String, pin: String) -> Result<(), String> {
-    hotkey::sync(&app, shot, long, pin)
+fn sync_hotkeys(
+    app: tauri::AppHandle,
+    shot: String,
+    long: String,
+    pin: String,
+    enabled: bool,
+) -> Result<(), String> {
+    hotkey::sync(&app, shot, long, pin, enabled)
 }
 
 /// 录制快捷键时挂起系统级热键（插件 unregister_all 语义）

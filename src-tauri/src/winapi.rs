@@ -18,14 +18,14 @@ use serde::Deserialize;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, EnumWindows, GetCursorPos, GetWindow, GetWindowTextLengthW,
     GetWindowTextW, GetWindowLongPtrW, IsIconic, IsWindowVisible,
-    PostMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GW_HWNDNEXT,
+    PostMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GW_HWNDNEXT,
     GWL_EXSTYLE, HWND_TOP, WM_MOUSEWHEEL, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE,
-    CWP_SKIPTRANSPARENT, SWP_NOACTIVATE, SWP_NOZORDER, WS_EX_APPWINDOW,
+    CWP_SKIPTRANSPARENT, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WS_EX_APPWINDOW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
@@ -78,6 +78,29 @@ pub fn harden(hwnd: HWND) {
     ensure_styles(hwnd, true, true);
 }
 
+/// 同步设置整块窗口的显隐。
+///
+/// tao 的 `hide()/show()` 只是给事件循环线程 `PostMessage`（`execute_in_thread`），
+/// 调用返回时 `ShowWindow` 往往还没执行，窗口此刻仍留在屏幕上。
+/// 抓屏这种「必须保证自己不在画面里」的路径要直接操作 HWND 才算数；
+/// 仍保留 tao 那一次调用，让它的 `WindowFlags::VISIBLE` 状态保持一致。
+pub fn set_shown(hwnd: HWND, shown: bool) {
+    unsafe {
+        let _ = ShowWindow(hwnd, if shown { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// 阻塞直到 DWM 处理完全部待决合成命令。
+///
+/// `ShowWindow(SW_HIDE)` 只是把窗口标记为待摘除，屏幕上真正少一块要等下一帧合成；
+/// 不等这一帧就 BitBlt，拍到的还是旧画面 —— 本应用上一帧通常盖着覆盖层的黑遮罩，
+/// 于是新截图整屏蒙一层灰（用户描述的「雾蒙蒙」）。抓屏前调用它把这条时序钉死。
+pub fn flush_composition() {
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
 /// 读-比-写地修正「由我们负责」的样式位，其余位原样保留。
 /// 穿透态把 WS_EX_TRANSPARENT 与 WS_EX_LAYERED 成对写入（tao 官方
 /// `set_ignore_cursor_events` 的同款组合）；恒常补 WS_EX_TOOLWINDOW、
@@ -102,11 +125,10 @@ fn ensure_styles(hwnd: HWND, transparent: bool, noactivate: bool) {
     }
 }
 
-/// 覆盖层模式开关：true = 强制可命中可聚焦；false = 交还给光标轮询
+/// 覆盖层模式开关：true = 强制可命中可聚焦；false = 交还给空闲态样式
+/// （穿透 + 不抢焦点，等价于 `harden`，写出来是为了让两个方向都不留静默 no-op）
 pub fn set_interactive(hwnd: HWND, interactive: bool) {
-    if interactive {
-        ensure_styles(hwnd, false, false);
-    }
+    ensure_styles(hwnd, !interactive, !interactive);
 }
 
 /// 启动 60Hz 穿透状态轮询线程

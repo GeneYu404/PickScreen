@@ -54,9 +54,20 @@ export function App() {
   /* ---------- 自动同步配置至 Rust 后端（快捷键 + 持久化） ---------- */
   useEffect(() => {
     if (!native || !settingsReady.current) return;
-    void NativeBridge.syncHotkeys(settings.hotkeys);
+    void NativeBridge.syncHotkeys(settings.hotkeys, settings.hotkeysEnabled);
     void NativeBridge.saveSettings(settings);
   }, [settings]);
+
+  /** 托盘事件回调里读到的最新配置（事件订阅不依赖 settings，避免每次改动都重订阅） */
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  /** 全局快捷键总开关：托盘菜单触发，落盘后由上面的 effect 同步给 Rust 注销/注册 */
+  const toggleHotkeys = useCallback(() => {
+    const next = !settingsRef.current.hotkeysEnabled;
+    setSettings((s) => ({ ...s, hotkeysEnabled: next }));
+    showToast(next ? '全局快捷键已开启' : '全局快捷键已关闭 · 仍可从托盘唤起');
+  }, [showToast]);
 
   /* ---------- 原生模式：屏蔽 WebView2 默认右键菜单（表单控件除外） ---------- */
   useEffect(() => {
@@ -135,8 +146,8 @@ export function App() {
     desktop?.setScreenImage(null);
     if (desktop) desktop.setWindows([]);
     setOverlay(null);
-    // 恢复面板：覆盖层是临时模式，关闭后不能让应用只剩托盘（取消/保存/复制路径都只有一条 toast）
-    setShowMain(true);
+    // 不恢复主面板：截图是「用完即走」的临时态，结束就回到桌面（hasContent 变 false → 整窗隐藏，
+    // 键盘焦点由 Rust end_overlay 交还给下层窗口）。配置面板仍可从托盘左键 / 右键菜单打开。
     if (native) void NativeBridge.endOverlay();
   }, [desktop]);
 
@@ -216,6 +227,7 @@ export function App() {
       else if (action === 'long') startOverlay('long');
       else if (action === 'pin') pinLast();
       else if (action === 'show') setShowMain(true);
+      else if (action === 'toggle_hotkeys') toggleHotkeys();
     }).then((u) => {
       if (disposed) u();
       else unlisten = u;
@@ -224,7 +236,7 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [startOverlay, pinLast]);
+  }, [startOverlay, pinLast, toggleHotkeys]);
 
   /* ---------- 应用内快捷键（浏览器环境；原生环境由 Rust 的 RegisterHotKey 接管） ---------- */
   useEffect(() => {
@@ -238,6 +250,10 @@ export function App() {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       const hk = settings.hotkeys;
+      if (!settings.hotkeysEnabled) {
+        if (e.key === 'Escape') setTrayMenu(false);
+        return;
+      }
       if (comboMatches(e, hk.shot)) {
         e.preventDefault();
         startOverlay('shot');
@@ -257,11 +273,12 @@ export function App() {
 
   /* ---------- 空闲时隐藏整块窗口 ----------
      这块 webview 覆盖整个虚拟桌面（Rust cover_virtual_desktop），
-     但只有「有东西要渲染」时才需要可见：配置面板 / 截图覆盖层 / 贴图。
-     三者皆空时把 HWND 藏掉，托盘常驻期间不占顶层窗口位，
+     但只有「有东西要渲染」时才需要可见：配置面板 / 截图覆盖层 / 贴图 / 提示条。
+     四者皆空时把 HWND 藏掉，托盘常驻期间不占顶层窗口位，
      Rust 侧 60Hz 穿透轮询也会因窗口不可见而自动休眠。
-     贴图必须计入，否则关掉面板会把已贴的图一起带走。 */
-  const hasContent = showMain || !!overlay || results.length > 0;
+     贴图与提示条必须计入：截图结束（Esc / 完成）后不再回主面板，
+     窗口只靠提示条再亮 2.6s，让「已复制到剪贴板 · 1024×768」这类回执仍然可见。 */
+  const hasContent = showMain || !!overlay || results.length > 0 || !!toast;
   useEffect(() => {
     if (!native) return;
     void NativeBridge.setWindowVisible(hasContent);
