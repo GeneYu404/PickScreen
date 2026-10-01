@@ -133,11 +133,13 @@ pub fn set_interactive(hwnd: HWND, interactive: bool) {
 
 /// 启动 60Hz 穿透状态轮询线程
 ///
-/// 窗口隐藏时整段跳过：此时 webview 一个像素都不渲染，穿透样式没有作用对象，
-/// 托盘常驻也不该为此每帧唤醒。窗口重新显示后下一帧（≤16ms）自动恢复。
+/// 窗口隐藏时整段跳过：此时 webview 不渲染任何东西，穿透样式没有作用对象。
+/// `self_capture`（截取本软件自身）期间同样冻结：这一路径要保持 WS_EX_LAYERED
+/// 让透明区域不参与合成，被本线程切成不透明就等于拿自己的窗口盖住待截的桌面。
 pub fn start_passthrough_thread(
     hwnd: HWND,
     overlay: std::sync::Arc<AtomicBool>,
+    self_capture: std::sync::Arc<AtomicBool>,
     regions: PassthroughRegions,
 ) {
     // HWND 内部是裸指针（非 Send），以 isize 携带进线程
@@ -147,6 +149,9 @@ pub fn start_passthrough_thread(
         loop {
             std::thread::sleep(Duration::from_millis(16));
             if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                continue;
+            }
+            if self_capture.load(Ordering::Relaxed) {
                 continue;
             }
             let in_overlay = overlay.load(Ordering::Relaxed);

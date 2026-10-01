@@ -34,12 +34,15 @@ export interface Settings {
   longResult: 'preview' | 'copy';
   /** 开机自动启动（登录 Windows 后在托盘静默运行） */
   autoStart: boolean;
+  /** 允许把拾屏自己的窗口也截进去（关闭时抓屏前先隐藏自己） */
+  captureSelf: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2', shotEnabled: true, longEnabled: true, pinEnabled: true },
   hotkeysEnabled: true,
   autoStart: false,
+  captureSelf: false,
   autoCopy: true,
   detectWindows: true,
   showMagnifier: true,

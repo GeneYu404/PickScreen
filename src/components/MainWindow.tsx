@@ -356,6 +356,9 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
               <Row title="开机自动启动" desc="登录 Windows 后在托盘静默运行（写入注册表，无需管理员）">
                 <Toggle on={settings.autoStart} disabled={autoStartBusy} onChange={() => void toggleAutoStart()} />
               </Row>
+              <Row title="允许截取拾屏自身" desc="开启后截图里会包含本软件的面板；关闭则抓屏前先隐藏自己（默认）">
+                <Toggle on={settings.captureSelf} onChange={(v) => set('captureSelf', v)} />
+              </Row>
               <Row title="关闭主窗口时最小化到托盘">
                 <Toggle on disabled />
               </Row>
@@ -434,8 +437,10 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                 <Toggle on={settings.hotkeysEnabled} onChange={(v) => set('hotkeysEnabled', v)} />
               </Row>
               <div className="bg-accent-soft border border-stroke rounded-lg px-4 py-2.5 text-[12px] text-fg2">
-                点击右侧方框后直接按下新的组合键即可修改；<b>Backspace</b> 清除、<b>Esc</b> 取消。若与其它动作冲突，两个动作会自动交换。
-                每组可单独开关；<b>总开关</b>关闭时三组都不注册到系统。
+                点击组合键方框后直接按下新的组合键即可修改，<b>Backspace</b> 清除、<b>Esc</b> 取消；
+                也可以直接点行末的「清除」把该组置为未设置（等于不注册到系统）。
+                若与其它动作冲突，两个动作会自动交换。
+                每组可用「启用」列单独开关；<b>总开关</b>关闭时三组都不注册。
                 {!settings.hotkeysEnabled && <b className="text-fg"> 当前总开关已关闭，组合键不会注册到系统。</b>}
               </div>
               <div className="bg-card border border-stroke rounded-lg overflow-hidden">
@@ -446,6 +451,7 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                       <th className="font-medium px-4 py-2.5">动作</th>
                       <th className="font-medium px-4 py-2.5">快捷键</th>
                       <th className="font-medium px-4 py-2.5">范围</th>
+                      <th className="font-medium px-4 py-2.5" />
                     </tr>
                   </thead>
                   <tbody className="text-fg">
@@ -471,6 +477,17 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                           />
                         </td>
                         <td className="px-4 py-2.5 text-fg3">全局</td>
+                        <td className="px-4 py-2.5 text-right">
+                          <button
+                            type="button"
+                            disabled={!combo}
+                            onClick={() => changeHotkey(field, '')}
+                            title={combo ? `清除「${label}」的快捷键（置为未设置，不再注册到系统）` : '该组已是未设置'}
+                            className="h-6 rounded px-2 text-[11.5px] text-fg2 transition-colors hover:bg-subtle hover:text-fg disabled:pointer-events-none disabled:opacity-30 cursor-pointer"
+                          >
+                            清除
+                          </button>
+                        </td>
                       </tr>
                     ))}
                     {[

@@ -232,8 +232,8 @@ export const NativeBridge = {
    * 抓取整块虚拟桌面：先隐藏本窗口 → 抓帧 → 显示并聚焦（避免把自己拍进去）。
    * 返回 ImageBitmap（物理像素1:1）。
    */
-  async grabScreen(): Promise<ImageBitmap> {
-    const u8 = asU8(await requireInvoke('grab_screen'));
+  async grabScreen(captureSelf = false): Promise<ImageBitmap> {
+    const u8 = asU8(await requireInvoke('grab_screen', { captureSelf }));
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     const w = dv.getUint32(0, true);
     const h = dv.getUint32(4, true);

@@ -124,7 +124,7 @@ export function App() {
       if (!native) return;
       void (async () => {
         try {
-          const bmp = await NativeBridge.grabScreen();
+          const bmp = await NativeBridge.grabScreen(settings.captureSelf);
           if (!desktop) return;
           desktop.setEraseRect(null);
           desktop.setWindows(

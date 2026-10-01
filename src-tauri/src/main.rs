@@ -55,32 +55,59 @@ fn hwnd_of(win: &tauri::WebviewWindow) -> Result<HWND, String> {
 
 /* ---------------- 命令 ---------------- */
 
-/// 抓取整块虚拟桌面：先隐藏本窗口（避免把自己拍进去）→ 抓帧 → 显示并聚焦
+/// 抓取整块虚拟桌面。
+///
+/// 默认路径：先隐藏本窗口（避免把自己拍进去）→ 等 DWM 合成 → 抓帧 → 恢复显示。
+///
+/// `capture_self = true` 走另一条路：窗口保持 `WS_EX_LAYERED` 且**不隐藏**。
+/// 透明区域不参与桌面合成，所以抓到的背景依旧干净，而面板（DOM）本身会被拍进去 ——
+/// 这就是「能否截取本软件自身」的开关。轮询线程在此期间冻结样式（`self_capture`），
+/// 否则它会在抓取途中把窗口切成不透明，整块窗口就盖住了待截的桌面。
 #[tauri::command]
-async fn grab_screen(app: tauri::AppHandle) -> Result<tauri::ipc::Response, String> {
+async fn grab_screen(
+    app: tauri::AppHandle,
+    capture_self: bool,
+) -> Result<tauri::ipc::Response, String> {
     let win = main_window(&app)?;
     let hwnd = hwnd_of(&win)?;
-    app.state::<SharedState>()
-        .overlay
-        .store(true, Ordering::Relaxed);
-    winapi::set_interactive(hwnd, true);
+    let st = app.state::<SharedState>();
 
-    // 隐藏必须「当场生效」：tao 的 hide() 只是 PostMessage 到事件循环线程，
-    // 直接在 HWND 上再 ShowWindow 一次，保证抓帧那一刻本窗口已经不在屏幕上。
-    win.hide().map_err(|e| e.to_string())?;
-    winapi::set_shown(hwnd, false);
+    let bytes = if capture_self {
+        // 空闲态窗口可能被前端整体隐藏过，先显示出来再抓
+        win.show().map_err(|e| e.to_string())?;
+        st.self_capture.store(true, Ordering::Relaxed);
+        // 不动样式：保持 layered，透明处不参与合成
+        let r = tauri::async_runtime::spawn_blocking(|| {
+            winapi::flush_composition();
+            capture::grab_virtual()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        st.self_capture.store(false, Ordering::Relaxed);
+        st.overlay.store(true, Ordering::Relaxed);
+        r?
+    } else {
+        st.overlay.store(true, Ordering::Relaxed);
+        winapi::set_interactive(hwnd, true);
 
-    let bytes = tauri::async_runtime::spawn_blocking(|| {
-        // 等 DWM 把这一帧合成完再抓。少了这一步：刚打断上一次截图（Esc/右键）就再按热键，
-        // 屏幕上还留着上一帧的 45% 黑遮罩，BitBlt 把它一起拍进来 → 整屏发灰。
-        winapi::flush_composition();
-        // 兜底：等 WebView2 的 DirectComposition 表面彻底交还
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        winapi::flush_composition();
-        capture::grab_virtual()
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+        // 隐藏必须「当场生效」：tao 的 hide() 只是 PostMessage 到事件循环线程，
+        // 直接在 HWND 上再 ShowWindow 一次，保证抓帧那一刻本窗口已经不在屏幕上。
+        win.hide().map_err(|e| e.to_string())?;
+        winapi::set_shown(hwnd, false);
+
+        let r = tauri::async_runtime::spawn_blocking(|| {
+            // 等 DWM 把这一帧合成完再抓。少了这一步：刚打断上一次截图（Esc/右键）就再按热键，
+            // 屏幕上还留着上一帧的 45% 黑遮罩，BitBlt 把它一起拍进来 → 整屏发灰。
+            winapi::flush_composition();
+            // 兜底：等 WebView2 的 DirectComposition 表面彻底交还
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            winapi::flush_composition();
+            capture::grab_virtual()
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        r
+    };
 
     win.show().map_err(|e| e.to_string())?;
     let _ = win.set_focus();
@@ -254,6 +281,7 @@ fn main() {
             winapi::start_passthrough_thread(
                 hwnd,
                 shared.overlay.clone(),
+                shared.self_capture.clone(),
                 winapi::PassthroughRegions(shared.regions.clone()),
             );
 

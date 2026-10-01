@@ -15,6 +15,9 @@ pub struct SharedState {
     pub regions: Arc<RegionSlot>,
     /// 是否处于截图覆盖层模式（此模式强制窗口可命中、可聚焦）
     pub overlay: Arc<AtomicBool>,
+    /// 「截取本软件自身」进行中：此时必须冻结窗口样式，
+    /// 否则 60Hz 轮询线程会把窗口切成不透明，整块窗口就盖住了待截的桌面。
+    pub self_capture: Arc<AtomicBool>,
     /// 全局热键控制（A：手写 RegisterHotKey 消息线程）
     pub hotkey: Arc<HotkeyCtl>,
 }
@@ -28,6 +31,7 @@ impl SharedState {
             stitcher: Arc::new(std::sync::Mutex::new(LongShot::new())),
             regions: Arc::new(std::sync::Mutex::new(Vec::new())),
             overlay: Arc::new(AtomicBool::new(false)),
+            self_capture: Arc::new(AtomicBool::new(false)),
             hotkey: Arc::new(HotkeyCtl::new()),
         }
     }
