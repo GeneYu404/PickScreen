@@ -5,6 +5,10 @@ export interface Hotkeys {
   long: string;
   /** 贴图（把最近一次截图钉在屏幕上） */
   pin: string;
+  /** 各动作是否注册到系统（与总开关 hotkeysEnabled 叠加，任一为假即不注册） */
+  shotEnabled: boolean;
+  longEnabled: boolean;
+  pinEnabled: boolean;
 }
 
 export interface Settings {
@@ -28,11 +32,14 @@ export interface Settings {
   longSpeed: 1 | 2 | 3;
   /** 长截图完成后的动作 */
   longResult: 'preview' | 'copy';
+  /** 开机自动启动（登录 Windows 后在托盘静默运行） */
+  autoStart: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2' },
+  hotkeys: { shot: 'Ctrl+1', long: 'Ctrl+3', pin: 'Ctrl+2', shotEnabled: true, longEnabled: true, pinEnabled: true },
   hotkeysEnabled: true,
+  autoStart: false,
   autoCopy: true,
   detectWindows: true,
   showMagnifier: true,

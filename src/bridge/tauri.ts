@@ -17,6 +17,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { load } from '@tauri-apps/plugin-store';
+import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 import type { Store } from '@tauri-apps/plugin-store';
 import type { Hotkeys, Settings } from '../types';
 
@@ -164,7 +165,34 @@ export const NativeBridge = {
   /* ===== 配置持久化：tauri-plugin-store（A 方案是手写 JSON 文件） ===== */
 
   async syncHotkeys(hotkeys: Hotkeys, enabled: boolean): Promise<void> {
-    await optionalInvoke('sync_hotkeys', { shot: hotkeys.shot, long: hotkeys.long, pin: hotkeys.pin, enabled });
+    await optionalInvoke('sync_hotkeys', {
+      shot: hotkeys.shot,
+      long: hotkeys.long,
+      pin: hotkeys.pin,
+      shotEnabled: hotkeys.shotEnabled,
+      longEnabled: hotkeys.longEnabled,
+      pinEnabled: hotkeys.pinEnabled,
+      enabled,
+    });
+  },
+
+  /* ===== 开机自启动（官方插件，浏览器环境静默降级） ===== */
+
+  /** 当前是否已注册开机自启（读系统真实状态，不是本地缓存） */
+  async isAutoStartEnabled(): Promise<boolean> {
+    if (!isTauriEnv()) return false;
+    try {
+      return await isEnabled();
+    } catch {
+      return false;
+    }
+  },
+
+  /** 开启 / 关闭开机自启。失败时抛错，由调用方回滚 UI 状态 */
+  async setAutoStart(on: boolean): Promise<void> {
+    if (!isTauriEnv()) return;
+    if (on) await enable();
+    else await disable();
   },
 
   async setHotkeyPaused(paused: boolean): Promise<void> {

@@ -142,9 +142,21 @@ fn sync_hotkeys(
     shot: String,
     long: String,
     pin: String,
+    shot_enabled: bool,
+    long_enabled: bool,
+    pin_enabled: bool,
     enabled: bool,
 ) -> Result<(), String> {
-    hotkey::sync(&app, shot, long, pin, enabled)
+    hotkey::sync(
+        &app,
+        shot,
+        long,
+        pin,
+        shot_enabled,
+        long_enabled,
+        pin_enabled,
+        enabled,
+    )
 }
 
 /// 录制快捷键时挂起系统级热键（插件 unregister_all 语义）
@@ -211,7 +223,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(SharedState::new())
-        // 四个官方插件（前端 JS 也使用 store / dialog）
+        // 官方插件（前端 JS 也使用 store / dialog）
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -222,6 +234,12 @@ fn main() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // 开机自启动：写 HKCU\...\CurrentVersion\Run，无需管理员。
+        // MacosLauncher 仅 macOS 生效，Windows 下不参与行为，这里只为保持跨平台签名一致。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let handle = app.handle().clone();
             let shared = app.state::<SharedState>().inner().clone();

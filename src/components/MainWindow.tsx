@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Settings2, Crop, ScrollText, Keyboard, Info, X, Minus, Pin } from 'lucide-react';
 import type { Settings, Hotkeys } from '../types';
 import { comboFromEvent, hotkeyCapture } from '../utils/hotkey';
-import { viewportCss } from '../bridge/tauri';
+import { viewportCss, NativeBridge } from '../bridge/tauri';
 import { APP_NAME, APP_NAME_EN, APP_VERSION } from '../brand';
 import { Kbd, Segmented, Slider, Toggle as ToggleSwitch } from './ui/Controls';
 
@@ -15,7 +15,8 @@ interface Props {
 }
 
 type Tab = 'general' | 'shot' | 'long' | 'keys' | 'about';
-type Field = keyof Hotkeys;
+/** 三个可绑定组合键的动作 —— 不要用 `keyof Hotkeys`，那会把 *Enabled 布尔字段也算进来 */
+type Field = 'shot' | 'long' | 'pin';
 
 /** 应用 Logo：青蓝渐变圆角方块 + 取景角标 + 中心画面 */
 export const AppLogo: React.FC<{ size?: number }> = ({ size = 20 }) => (
@@ -122,7 +123,8 @@ const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void; disa
 
 export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Props) {
   const [tab, setTab] = useState<Tab>('general');
-  const [autoStart, setAutoStart] = useState(true);
+  /** 自启动开关的「写系统」中转态：写失败时回滚设置并提示 */
+  const [autoStartBusy, setAutoStartBusy] = useState(false);
   const WIN_W = 820;
   const WIN_H = 560;
   const [pos, setPos] = useState({
@@ -158,6 +160,23 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
     };
   }, []);
 
+  /**
+   * 自启动开关的初始值以**系统真实状态**为准，而不是 settings 里的缓存：
+   * 用户可能在「任务管理器 → 启动」里手动改过，缓存会撒谎。
+   */
+  useEffect(() => {
+    let alive = true;
+    void NativeBridge.isAutoStartEnabled().then((real) => {
+      if (!alive) return;
+      if (real !== settings.autoStart) onChange({ ...settings, autoStart: real });
+    });
+    return () => {
+      alive = false;
+    };
+    // 仅在挂载时读一次；后续由 toggleAutoStart 写系统后自行维持
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     const move = (e: MouseEvent) => {
       if (!dragRef.current) return;
@@ -185,6 +204,31 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
     if (conflict) next[conflict] = hk[field];
     next[field] = combo;
     onChange({ ...settings, hotkeys: next });
+  };
+
+  /** 开启 / 关闭单个动作的全局快捷键（总开关之外，组内独立） */
+  const toggleHotkeyEnabled = (field: 'shot' | 'long' | 'pin') => {
+    const key = `${field}Enabled` as const;
+    onChange({ ...settings, hotkeys: { ...settings.hotkeys, [key]: !settings.hotkeys[key] } });
+  };
+
+  /**
+   * 开机自启动：真正写入 HKCU\...\CurrentVersion\Run（官方插件）。
+   * 失败时把设置回滚，避免 UI 显示「已开启」而系统里其实没有。
+   */
+  const toggleAutoStart = async () => {
+    const next = !settings.autoStart;
+    const prev = settings.autoStart;
+    onChange({ ...settings, autoStart: next });
+    setAutoStartBusy(true);
+    try {
+      await NativeBridge.setAutoStart(next);
+    } catch {
+      onChange({ ...settings, autoStart: prev });
+      setTab('general');
+    } finally {
+      setAutoStartBusy(false);
+    }
   };
 
   const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -309,8 +353,8 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
               <Row title="截图完成后自动复制到剪贴板" desc="点击「完成」或双击选区时，把结果写入剪贴板">
                 <Toggle on={settings.autoCopy} onChange={(v) => set('autoCopy', v)} />
               </Row>
-              <Row title="开机自动启动" desc="登录 Windows 后在托盘静默运行">
-                <Toggle on={autoStart} onChange={setAutoStart} />
+              <Row title="开机自动启动" desc="登录 Windows 后在托盘静默运行（写入注册表，无需管理员）">
+                <Toggle on={settings.autoStart} disabled={autoStartBusy} onChange={() => void toggleAutoStart()} />
               </Row>
               <Row title="关闭主窗口时最小化到托盘">
                 <Toggle on disabled />
@@ -391,39 +435,44 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
               </Row>
               <div className="bg-accent-soft border border-stroke rounded-lg px-4 py-2.5 text-[12px] text-fg2">
                 点击右侧方框后直接按下新的组合键即可修改；<b>Backspace</b> 清除、<b>Esc</b> 取消。若与其它动作冲突，两个动作会自动交换。
+                每组可单独开关；<b>总开关</b>关闭时三组都不注册到系统。
                 {!settings.hotkeysEnabled && <b className="text-fg"> 当前总开关已关闭，组合键不会注册到系统。</b>}
               </div>
               <div className="bg-card border border-stroke rounded-lg overflow-hidden">
                 <table className="w-full text-[12.5px]">
                   <thead>
                     <tr className="bg-layer text-left text-fg2">
+                      <th className="font-medium px-4 py-2.5">启用</th>
                       <th className="font-medium px-4 py-2.5">动作</th>
                       <th className="font-medium px-4 py-2.5">快捷键</th>
                       <th className="font-medium px-4 py-2.5">范围</th>
                     </tr>
                   </thead>
                   <tbody className="text-fg">
-                    <tr className="border-t border-stroke">
-                      <td className="px-4 py-2.5">截图</td>
-                      <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.shot} onChange={(v) => changeHotkey('shot', v)} disabled={!settings.hotkeysEnabled} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg3">全局</td>
-                    </tr>
-                    <tr className="border-t border-stroke">
-                      <td className="px-4 py-2.5">长截图</td>
-                      <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.long} onChange={(v) => changeHotkey('long', v)} disabled={!settings.hotkeysEnabled} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg3">全局</td>
-                    </tr>
-                    <tr className="border-t border-stroke">
-                      <td className="px-4 py-2.5">贴图（最近一次截图）</td>
-                      <td className="px-4 py-2.5">
-                        <HotkeyField value={settings.hotkeys.pin} onChange={(v) => changeHotkey('pin', v)} disabled={!settings.hotkeysEnabled} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg3">全局</td>
-                    </tr>
+                    {([
+                      ['shot', '截图', settings.hotkeys.shot],
+                      ['long', '长截图', settings.hotkeys.long],
+                      ['pin', '贴图（最近一次截图）', settings.hotkeys.pin],
+                    ] as const).map(([field, label, combo]) => (
+                      <tr key={field} className="border-t border-stroke">
+                        <td className="px-4 py-2.5">
+                          <Toggle
+                            on={settings.hotkeys[`${field}Enabled`]}
+                            disabled={!settings.hotkeysEnabled}
+                            onChange={() => toggleHotkeyEnabled(field)}
+                          />
+                        </td>
+                        <td className="px-4 py-2.5">{label}</td>
+                        <td className="px-4 py-2.5">
+                          <HotkeyField
+                            value={combo}
+                            onChange={(v) => changeHotkey(field, v)}
+                            disabled={!settings.hotkeysEnabled || !settings.hotkeys[`${field}Enabled`]}
+                          />
+                        </td>
+                        <td className="px-4 py-2.5 text-fg3">全局</td>
+                      </tr>
+                    ))}
                     {[
                       ['完成（复制并关闭）', ['Enter', '双击选区'], '截图界面'],
                       ['取消 / 退出工具', ['Esc', '右键'], '截图界面'],
