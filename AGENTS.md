@@ -86,7 +86,7 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
 
 1. **`body` 必须保持 `background: transparent`。**
    任何不透明底色都会把整块 webview 刷成纯色、盖住用户真实桌面。
-   模拟桌面的底色由 `App.tsx` 根节点在 `showSim` 时单独挂 `--desktop`，不要挪到 body。
+   （模拟桌面已删除，不再有「谁负责给 body 上色」的问题——body 恒为透明。）
 2. **浮在用户真实屏幕上的色块必须固定，不能跟随主题。**
    判据：**该色块背后是本应用的窗口表面，还是用户的桌面？**
    - 桌面之上 → 固定色（覆盖层 `ACCENT = '#2b6cf0'`、坐标/尺寸读数气泡、放大镜、toast 深色条）
@@ -95,7 +95,38 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
 另：托盘菜单用浅色 `bg-acrylic` 是**对的** —— Windows 11 原生右键菜单本身就是浅色亚克力，
 那是正常窗口表面，不是穿透层。
 
-## 6. 改动前先核对清单
+## 6. webview 只做 UI，不重新实现后端
+
+**Rust 负责所有系统能力，webview 只负责渲染 UI 与用户交互。**
+判断新代码该不该写进前端的标准：**它是否需要「操作系统」的知识？**
+需要 → 写进 Rust；不需要（纯裁剪 / 取色 / 画标注）→ 才写前端。
+
+前端只允许做这几件纯 canvas 运算（都在 `bridge/desktop.ts`）：
+
+| 允许 | 说明 |
+| --- | --- |
+| `captureRegion(r)` | 从已抓到的帧里裁一块 |
+| `getPixel(x, y)` | 读像素颜色 |
+| `setEraseRect(r)` | 长截图时把选区擦成透明 |
+| `hitTest` / `detectRegions` | 遍历 **Rust `list_windows` 给的**真实窗口矩形 |
+
+已从前端删除、**不要以任何形式加回来**的东西：
+
+- ❌ `sim/desktop.ts` 模拟的 Windows 桌面（壁纸 / 任务栏 / 假 Edge 长文 / 假记事本）
+- ❌ `utils/stitch.ts` 的 TypeScript 拼接器 —— 拼接只在 Rust `stitch.rs` 里
+- ❌ `utils/capture.ts` 的 getDisplayMedia 降级
+- ❌ 任何 `if (native) { Rust } else { JS 重新实现 }` 的双路径写法
+
+Rust 已提供对应命令，不要在前端另写一套：
+`grab_screen` / `list_windows` / `scroll_region` / `long_begin` / `long_push` /
+`long_preview` / `long_finish` / `long_cancel` / `copy_png` / `save_png`。
+
+`bridge/desktop.ts` 的 no-op 降级是**结构自带**的，不靠 `isTauriEnv()` 分支：
+浏览器下没人调 `setScreenImage`，画布自然保持透明，`detectRegions()` 自然退化成「全屏」。
+
+> 代价：浏览器预览只能展示设置面板等 UI，**无法演示截图功能**（没有画面可截）。这是有意接受的。
+
+## 7. 改动前先核对清单
 
 1. 改到窗口显隐 / 穿透逻辑了吗？→ 见 §3、§5
 2. 动了 `data-region` 属性吗？→ **不能删改**。原生鼠标穿透靠前端每 250ms 用
@@ -104,10 +135,12 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
    顺序反了会把自己拍进去（套娃）
 4. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
    内联进产物，**grep 时别只搜 `src/`**
-5. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
-6. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
+5. 新逻辑该写前端还是 Rust？→ 见 §6。**先问「它是否需要操作系统的知识」**，
+   需要就写 Rust。前端只做纯 canvas 运算
+6. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
+7. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
 
-## 7. 验证步骤
+## 8. 验证步骤
 
 ```bash
 bun run typecheck     # tsc --noEmit，TS 7 比 5 严格
@@ -130,7 +163,7 @@ $d -match '要确认的文案'      # 确认改动进了产物
 
 `index.html`、`src/**` 都会被 Vite singlefile 内联进 `dist/index.html`，直接从产物 grep 最可靠。
 
-## 8. 设计稿 ≠ 实际代码
+## 9. 设计稿 ≠ 实际代码
 
 [后端方案.md](后端方案.md) 第三节是**原始设计稿**（含 `todo!()` 占位），
 第六节才记录与实际仓库的差异。单窗口模型、抓屏只用 BitBlt（未启用 WGC）、
