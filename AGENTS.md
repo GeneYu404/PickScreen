@@ -39,7 +39,41 @@ bun run build:exe        # = tauri build --no-bundle
 - ❌ 手工删建来"清理"构建产物
 - ✅ 损坏时走 `mbx clean && mbx adopt`
 
-## 4. 透明穿透窗口 —— 本项目最容易踩的坑
+## 4. Git
+
+本仓库是 git 仓库，分支 `main`，**目前没有配置远端**（仅本地版本管理）。
+提交身份用已配置的全局值 `GeneYu <61930645+GeneYu404@users.noreply.github.com>`，不要写死别的。
+
+**commit**：
+
+- 消息格式 `<scope>: <一句话>`，例：`fix:` / `feat:` / `docs:` / `chore:`
+- 用户没明确要求就**不要 commit / push**；建仓库、改代码都不等于授权提交
+- 要删文件先问用户；`rm` 走运行时可恢复删除（`mavis-trash`），不要用永久删除命令
+
+**`src-tauri/target` 绝不能进版本库。** `.gitignore` 里那条规则**不能带尾斜杠**：
+
+| 规则 | 结果 |
+| --- | --- |
+| `src-tauri/target/`（带斜杠） | ❌ 尾斜杠只匹配目录，git 看到的是 symlink，**规则失效** |
+| `src-tauri/target`（无斜杠） | ✅ 正确忽略 |
+
+一旦失效，target 会被当 `120000` 条目提交，克隆到别的机器就是指向
+`D:\mbx\...` 的死链，**本地完全看不出来**。所以暂存后必须自查：
+
+```bash
+git ls-files -s | Select-String '120000'   # 必须无输出
+git check-ignore -v src-tauri/target       # 必须命中 .gitignore
+```
+
+**换行符**：`index.html`（根）与 `.gitattributes` 由 git 按 `* text=auto eol=lf` 处理，
+索引里恒为 LF。**不要改成 `eol=crlf`** —— 那会把 CRLF 写死进规则，
+macOS/Linux 克隆也会被污染成 CRLF。本仓库没有任何 `.bat`/`.cmd`/`.ps1`/`.sh`，
+Windows 上用 LF 无兼容问题，无需改成 CRLF。
+
+**远端**：用户当前未要求配置。将来要加 remote 或 push，先问；
+force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force`。
+
+## 5. 透明穿透窗口 —— 本项目最容易踩的坑
 
 主窗口**不是普通窗口**，它是一块铺满整块虚拟桌面的透明穿透 webview：
 
@@ -61,18 +95,19 @@ bun run build:exe        # = tauri build --no-bundle
 另：托盘菜单用浅色 `bg-acrylic` 是**对的** —— Windows 11 原生右键菜单本身就是浅色亚克力，
 那是正常窗口表面，不是穿透层。
 
-## 5. 改动前先核对清单
+## 6. 改动前先核对清单
 
-1. 改到窗口显隐 / 穿透逻辑了吗？→ 见 §3、§4
+1. 改到窗口显隐 / 穿透逻辑了吗？→ 见 §3、§5
 2. 动了 `data-region` 属性吗？→ **不能删改**。原生鼠标穿透靠前端每 250ms 用
    `querySelectorAll('[data-region]')` 同步矩形给 Rust，丢了会导致整窗不可点或不可穿透
 3. 动了 `grab_screen` 的 hide/show 顺序吗？→ 必须**先隐藏 → 抓帧 → 再 show**，
    顺序反了会把自己拍进去（套娃）
 4. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
    内联进产物，**grep 时别只搜 `src/`**
-5. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
+5. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
+6. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
 
-## 6. 验证步骤
+## 7. 验证步骤
 
 ```bash
 bun run typecheck     # tsc --noEmit，TS 7 比 5 严格
@@ -95,7 +130,7 @@ $d -match '要确认的文案'      # 确认改动进了产物
 
 `index.html`、`src/**` 都会被 Vite singlefile 内联进 `dist/index.html`，直接从产物 grep 最可靠。
 
-## 7. 设计稿 ≠ 实际代码
+## 8. 设计稿 ≠ 实际代码
 
 [后端方案.md](后端方案.md) 第三节是**原始设计稿**（含 `todo!()` 占位），
 第六节才记录与实际仓库的差异。单窗口模型、抓屏只用 BitBlt（未启用 WGC）、
