@@ -1,0 +1,22 @@
+# 依赖
+node_modules/
+
+# 前端构建产物
+dist/
+
+# Rust 编译缓存
+# ⚠️ src-tauri/target 是 mbx 缓存 symlink（mode 120000 → D:\mbx\targets\v1\<hash>）。
+# 这里必须**不带尾斜杠**：尾斜杠只匹配目录，git 看到的是符号链接，加了斜杠规则会失效，
+# 结果 target 被当成 120000 条目提交，换台机器克隆就是一个指向不存在路径的死链。
+# 损坏时走 `mbx clean && mbx adopt`，不要手工删建。
+src-tauri/target
+
+# Tauri 移动端 / 其它生成目录
+src-tauri/gen/
+
+# 构建产物
+*.exe
+*.msi
+
+# 运行时落盘
+*.log

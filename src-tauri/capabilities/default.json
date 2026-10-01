@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "拾屏 B 默认能力：核心能力 + 官方插件权限（store / dialog）",
+  "windows": ["main"],
+  "permissions": ["core:default", "store:default", "dialog:default"]
+}

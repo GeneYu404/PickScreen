@@ -1,0 +1,19 @@
+# 统一换行符为 LF。
+# Windows 的 core.autocrlf 默认会在检出时把仓库里的 LF 改写成 CRLF，
+# 导致同一份源码在 Linux/macOS 上克隆后反过来又被转回去，产生噪声 diff。
+# text=auto 让 git 自行识别文本/二进制，eol=lf 强制工作区用 LF。
+* text=auto eol=lf
+
+# 二进制文件明确标记，避免被当作文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.pdf binary
+*.exe binary
+*.msi binary
