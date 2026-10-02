@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Crop, ScrollText, Settings2, Info, Power, Pin } from 'lucide-react';
+import { emit, listen } from '@tauri-apps/api/event';
 import { ScreenFrame } from './bridge/desktop';
 import type { DetectRegion } from './bridge/desktop';
 import { ScreenshotOverlay } from './components/ScreenshotOverlay';
@@ -10,15 +11,29 @@ import { DEFAULT_SETTINGS } from './types';
 import type { Settings, ResultItem } from './types';
 import { APP_NAME, APP_VERSION } from './brand';
 import { comboMatches, hotkeyCapture } from './utils/hotkey';
-import { isTauriEnv, NativeBridge } from './bridge/tauri';
+import { currentWindowLabel, isTauriEnv, NativeBridge } from './bridge/tauri';
 
 const uid = () => Math.random().toString(36).slice(2, 7);
 
 /** 是否运行在 Tauri v2 + WebView2 原生容器中（模块级常量，双环境编译） */
 const native = isTauriEnv();
 
+/**
+ * 当前 webview 是哪个窗口。
+ *
+ * 拆窗之后这是整个前端的分流依据：
+ * - `main`：配置面板。正常尺寸（820×560）的普通窗口，整块可交互，只渲染面板本身。
+ * - `overlay`：铺满虚拟桌面的透明穿透窗，承载抓屏画布 / 截图覆盖层 / 贴图 /
+ *   提示条 / 托盘菜单。60Hz 穿透轮询只作用在它身上。
+ *
+ * 两者通过 Rust 的全局 `action` 事件通信（托盘、热键、面板显隐、配置变更），
+ * 没有任何一个窗口需要「同时」知道对方的 DOM。
+ */
+const isPanel = currentWindowLabel() === 'main';
+
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // 抓屏画布只属于覆盖层窗口；面板窗口没有 canvas 也不需要。
   const [desktop, setDesktop] = useState<ScreenFrame | null>(null);
 
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -34,14 +49,46 @@ export function App() {
   /** 配置加载完成前不回写，避免用默认值覆盖磁盘上的旧配置 */
   const settingsReady = useRef(!native);
 
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 2600);
-  }, []);
+  /**
+   * 统一提示条的位置是「屏幕底部居中」，那是 overlay 窗口（全屏）的地盘。
+   * 面板窗口没有 toast 的 UI，若让它自己 setToast，用户在面板里点开关会**看不到任何反馈**。
+   * 所以面板侧一律广播给 overlay 窗口显示 —— 位置与拆窗前完全一致。
+   */
+  const showToast = useCallback(
+    (msg: string) => {
+      if (isPanel) {
+        if (native) void emit('toast', msg);
+        return;
+      }
+      setToast(msg);
+      window.clearTimeout(toastTimer.current);
+      toastTimer.current = window.setTimeout(() => setToast(null), 2600);
+    },
+    [isPanel]
+  );
+
+  /* ---------- 面板窗口广播过来的提示条 ---------- */
+  useEffect(() => {
+    if (!native || isPanel) return;
+    let un: (() => void) | null = null;
+    let disposed = false;
+    void listen<string>('toast', (e) => {
+      if (disposed) return;
+      setToast(String(e.payload ?? ''));
+      window.clearTimeout(toastTimer.current);
+      toastTimer.current = window.setTimeout(() => setToast(null), 2600);
+    }).then((u) => {
+      if (disposed) u();
+      else un = u;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, [isPanel]);
 
   /* ---------- 启动时读取已保存配置 ---------- */
-  useEffect(() => {
+  const reloadSettings = useCallback(() => {
     if (!native) return;
     void NativeBridge.loadSettings().then((saved) => {
       if (saved) {
@@ -51,16 +98,42 @@ export function App() {
     });
   }, []);
 
+  useEffect(() => {
+    reloadSettings();
+  }, [reloadSettings]);
+
+  /* ---------- 跨窗口：配置变更广播 ----------
+     只有面板窗口会改配置（设置 UI 在它身上），落盘后广播一次，
+     覆盖层窗口据此刷新托盘菜单里显示的快捷键。频率极低，直接重读 store 即可。 */
+  useEffect(() => {
+    if (!native) return;
+    let un: (() => void) | null = null;
+    if (isPanel) {
+      void listen('settings-changed', () => reloadSettings()).then((u) => {
+        un = u;
+      });
+    }
+    return () => {
+      un?.();
+    };
+  }, [isPanel, reloadSettings]);
+
   /* ---------- 自动同步配置至 Rust 后端（快捷键 + 持久化） ---------- */
   useEffect(() => {
     if (!native || !settingsReady.current) return;
     void NativeBridge.syncHotkeys(settings.hotkeys, settings.hotkeysEnabled);
-    void NativeBridge.saveSettings(settings);
-  }, [settings]);
+    void NativeBridge.saveSettings(settings).then(() => {
+      if (isPanel) void emit('settings-changed');
+    });
+  }, [settings, isPanel]);
 
   /** 托盘事件回调里读到的最新配置（事件订阅不依赖 settings，避免每次改动都重订阅） */
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+
+  /** 同理：事件回调里读到的最新面板显隐状态（截图前后要还原它） */
+  const showMainRef = useRef(showMain);
+  showMainRef.current = showMain;
 
   /** 全局快捷键总开关：托盘菜单触发，落盘后由上面的 effect 同步给 Rust 注销/注册 */
   const toggleHotkeys = useCallback(() => {
@@ -81,9 +154,9 @@ export function App() {
     return () => document.removeEventListener('contextmenu', onCtx);
   }, []);
 
-  /* ---------- 定期同步「参与鼠标穿透切换」的矩形：贴图 / 设置面板 / 托盘菜单 ---------- */
+  /* ---------- 定期同步「参与鼠标穿透切换」的矩形（仅覆盖层窗口：贴图 / 托盘菜单） ---------- */
   useEffect(() => {
-    if (!native) return;
+    if (!native || isPanel) return;
     const sync = () => {
       const regions = Array.from(document.querySelectorAll<HTMLElement>('[data-region]')).map((el, i) => {
         const r = el.getBoundingClientRect();
@@ -95,10 +168,11 @@ export function App() {
     sync();
     const id = window.setInterval(sync, 250);
     return () => window.clearInterval(id);
-  }, []);
+  }, [isPanel]);
 
-  /* ---------- 初始化桌面（原生模式：不绘制模拟桌面，画布保持透明） ---------- */
+  /* ---------- 初始化桌面（仅覆盖层窗口需要真实抓帧画布） ---------- */
   useEffect(() => {
+    if (isPanel) return;
     if (!canvasRef.current) return;
     const d = new ScreenFrame(canvasRef.current);
     setDesktop(d);
@@ -112,18 +186,29 @@ export function App() {
       window.removeEventListener('resize', onResize);
       window.clearInterval(clock);
     };
-  }, []);
+  }, [isPanel]);
 
-  /* ---------- 启动截图：原生模式先隐藏窗口抓一帧真实屏幕，再铺到覆盖层 ---------- */
+  /* ---------- 启动截图：覆盖层窗口先藏起自己抓一帧真实屏幕，再铺到覆盖层 ---------- */
   const startOverlay = useCallback(
     (mode: 'shot' | 'long') => {
       if (overlay || hotkeyCapture.active) return;
-      setShowMain(false);
+      if (isPanel) {
+        // 面板窗口不承载覆盖层：直接广播，由 overlay 窗口接手。
+        if (native) void emit('action', mode);
+        return;
+      }
       setTrayMenu(false);
       setOverlay({ mode });
       if (!native) return;
       void (async () => {
         try {
+          // 「截取拾屏自身」时面板必须在场才能被拍进去。托盘常驻下它通常隐藏着
+          // （从托盘/热键触发更是必然没开），此时必须先让**面板窗口**把自己显示出来
+          // ——Rust 不能代劳：它只会 show HWND，面板窗口的 React 还停在 showMain=false，
+          // 那样显示出来是一片空白。广播 'show' 走面板窗口自己的路径，由它渲染。
+          if (settings.captureSelf && !showMainRef.current) {
+            void emit('action', 'show');
+          }
           const bmp = await NativeBridge.grabScreen(settings.captureSelf);
           if (!desktop) return;
           desktop.setEraseRect(null);
@@ -133,12 +218,14 @@ export function App() {
           desktop.setScreenImage(bmp);
         } catch (err) {
           setOverlay(null);
-          setShowMain(true);
           showToast(`抓取屏幕失败：${String(err)}`);
+          // 失败路径同样要让面板收起来，否则它会停在「grab_screen 已藏窗、
+          // 但 showMain 还是 true」的不一致状态里，之后托盘唤不回来。
+          if (native) void emit('action', 'overlay-end');
         }
       })();
     },
-    [overlay, desktop, showToast]
+    [overlay, desktop, showToast, isPanel, settings.captureSelf]
   );
 
   const closeOverlay = useCallback(() => {
@@ -146,9 +233,13 @@ export function App() {
     desktop?.setScreenImage(null);
     if (desktop) desktop.setWindows([]);
     setOverlay(null);
-    // 不恢复主面板：截图是「用完即走」的临时态，结束就回到桌面（hasContent 变 false → 整窗隐藏，
-    // 键盘焦点由 Rust end_overlay 交还给下层窗口）。配置面板仍可从托盘左键 / 右键菜单打开。
+    // 截图是「用完即走」的临时态，结束就回到桌面（覆盖层窗口 hasContent 变 false →
+    // 整窗隐藏，键盘焦点由 Rust end_overlay 交还给下层窗口）。配置面板仍可从托盘唤起。
     if (native) void NativeBridge.endOverlay();
+    // 通知面板窗口收起来。注意**不能**反过来在 startOverlay 一开始就 emit 让面板关闭：
+    // 抓屏期间面板必须留在屏上，「允许截取拾屏自身」才截得到它。
+    // Rust 的 grab_screen 只在 capture_self == false 时藏面板。
+    if (native) void emit('action', 'overlay-end');
   }, [desktop]);
 
   /* ---------- 结果处理 ---------- */
@@ -216,6 +307,26 @@ export function App() {
     showToast('已贴图 · 拖动移动 · 滚轮缩放 · 悬停后点 ✕ 关闭');
   }, [overlay, results, desktop, settings.hotkeys.shot, showToast]);
 
+  /* ---------- 打开配置面板（面板窗口自己显示自己；覆盖层窗口广播过去） ---------- */
+  const openPanel = useCallback(() => {
+    setTrayMenu(false);
+    if (isPanel) {
+      setShowMain(true);
+    } else if (native) {
+      void emit('action', 'show');
+    }
+  }, [isPanel]);
+
+  /**
+   * 截图**之前**面板是不是开着的。
+   *
+   * 面板不能在截图一开始就关 —— 开着面板截一张含拾屏界面的图正是 `capture_self` 的用途。
+   * 但 Rust 的 `grab_screen` 在 `capture_self == false` 时会把面板藏掉，而 React 的
+   * `showMain` 仍是 true，于是 `hasContent` 不变化、那个 effect 不会重跑，没人把它放回来。
+   * 所以这里记一份「截图前的原状」，等 `overlay-end` 再连同显隐一起恢复。
+   */
+  const panelWasOpen = useRef(false);
+
   /* ---------- 原生模式：订阅 Rust 侧全局热键 / 托盘事件 ---------- */
   useEffect(() => {
     if (!native) return;
@@ -223,11 +334,28 @@ export function App() {
     let unlisten: (() => void) | null = null;
     void NativeBridge.onNativeAction((action) => {
       if (disposed) return;
-      if (action === 'shot') startOverlay('shot');
-      else if (action === 'long') startOverlay('long');
-      else if (action === 'pin') pinLast();
-      else if (action === 'show') setShowMain(true);
-      else if (action === 'toggle_hotkeys') toggleHotkeys();
+      // 每个窗口只解读与自己相关的动作：`emit` 是全局广播，两边都会收到。
+      if (action === 'shot' || action === 'long' || action === 'pin') {
+        if (isPanel) {
+          if (action !== 'pin') panelWasOpen.current = showMainRef.current;
+          return;
+        }
+        if (action === 'pin') pinLast();
+        else startOverlay(action);
+      } else if (action === 'show') {
+        // 面板窗口负责真正显示；覆盖层窗口只需要关掉托盘菜单。
+        if (isPanel) setShowMain(true);
+        else setTrayMenu(false);
+      } else if (action === 'overlay-end') {
+        if (!isPanel) return;
+        setShowMain(panelWasOpen.current);
+        // 显式 show，不能只靠 setShowMain：原值可能就是 true（面板没关过），
+        // 那样 hasContent 不变、effect 不跑，Rust 藏起来的窗口就再也回不来。
+        if (panelWasOpen.current) void NativeBridge.setWindowVisible(true);
+      } else if (action === 'toggle_hotkeys') {
+        if (isPanel) toggleHotkeys();
+        else showToast('全局快捷键开关在配置面板里');
+      }
     }).then((u) => {
       if (disposed) u();
       else unlisten = u;
@@ -236,7 +364,7 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [startOverlay, pinLast, toggleHotkeys]);
+  }, [startOverlay, pinLast, toggleHotkeys, showToast, isPanel]);
 
   /* ---------- 应用内快捷键（浏览器环境；原生环境由 Rust 的 RegisterHotKey 接管） ---------- */
   useEffect(() => {
@@ -269,21 +397,63 @@ export function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [native, overlay, startOverlay, pinLast, settings.hotkeys]);
+  }, [native, overlay, startOverlay, pinLast, settings.hotkeys, settings.hotkeysEnabled]);
 
-  /* ---------- 空闲时隐藏整块窗口 ----------
-     这块 webview 覆盖整个虚拟桌面（Rust cover_virtual_desktop），
-     但只有「有东西要渲染」时才需要可见：配置面板 / 截图覆盖层 / 贴图 / 提示条。
-     四者皆空时把 HWND 藏掉，托盘常驻期间不占顶层窗口位，
+  /* ---------- 空闲时隐藏窗口 ----------
+     两个窗口各算各的：面板窗口只看「有没有面板」，覆盖层窗口看「有没有覆盖层 /
+     贴图 / 提示条 / 托盘菜单」。全都为空时把 HWND 藏掉，托盘常驻期间不占顶层窗口位，
      Rust 侧 60Hz 穿透轮询也会因窗口不可见而自动休眠。
-     贴图与提示条必须计入：截图结束（Esc / 完成）后不再回主面板，
+     贴图与提示条必须计入覆盖层：截图结束（Esc / 完成）后不再回主面板，
      窗口只靠提示条再亮 2.6s，让「已复制到剪贴板 · 1024×768」这类回执仍然可见。 */
-  const hasContent = showMain || !!overlay || results.length > 0 || !!toast;
+  const hasContent = isPanel ? showMain : !!overlay || results.length > 0 || !!toast || trayMenu;
   useEffect(() => {
     if (!native) return;
     void NativeBridge.setWindowVisible(hasContent);
   }, [hasContent, native]);
 
+  /* ---------- 面板窗口：标记 html 为不透明底（与 Rust 注入、内联脚本三路互为兜底） ---------- */
+  useEffect(() => {
+    if (!isPanel) return;
+    document.documentElement.setAttribute('data-win', 'main');
+    document.body.style.background = 'var(--bg)';
+  }, [isPanel]);
+
+  /* ---------- 面板窗口：首帧绘制完成后上报，供抓屏做条件等待 ----------
+     双 rAF：第一帧执行时 DOM 已提交，但浏览器往往还没把它真正合成上屏；
+     第二帧回调时，屏幕像素才是最新的。 */
+  useEffect(() => {
+    if (!native || !isPanel) return;
+    const id = requestAnimationFrame(() => {
+      requestAnimationFrame(() => void NativeBridge.markPanelPainted());
+    });
+    return () => cancelAnimationFrame(id);
+  }, [isPanel]);
+
+  /* ================= 面板窗口：只渲染配置面板 ================= */
+  if (isPanel) {
+    // 注意：这里**不能**有 onMouseDown={stopPropagation}。它在冒泡阶段掐断 Tauri 对
+    // `data-tauri-drag-region` 的原生拖拽探测，表现为标题栏拖不动。它原本存在只为
+    // 「点面板时别关掉托盘菜单」，而托盘菜单现在住在 overlay 窗口，理由已不成立。
+    //
+    // 根节点必须自带不透明底色：窗口已是 transparent:false + 无 WS_EX_LAYERED，
+    // 而 body 恒为 transparent（overlay 窗口需要），这里不铺满就会露黑。
+    return (
+      <div className="fixed inset-0 overflow-hidden select-none bg-app">
+        {showMain && (
+          <MainWindow
+            settings={settings}
+            onChange={setSettings}
+            onClose={() => setShowMain(false)}
+            onShot={() => startOverlay('shot')}
+            onLong={() => startOverlay('long')}
+            onToast={showToast}
+          />
+        )}
+      </div>
+    );
+  }
+
+  /* ================= 覆盖层窗口：抓屏画布 / 覆盖层 / 贴图 / 托盘菜单 / 提示条 ================= */
   return (
     <div
       className="fixed inset-0 overflow-hidden select-none"
@@ -318,20 +488,14 @@ export function App() {
           <div className="h-px bg-stroke my-1" />
           <button
             type="button"
-            onClick={() => {
-              setShowMain(true);
-              setTrayMenu(false);
-            }}
+            onClick={openPanel}
             className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
           >
             <Settings2 size={15} className="text-fg2" /> 配置…
           </button>
           <button
             type="button"
-            onClick={() => {
-              setShowMain(true);
-              setTrayMenu(false);
-            }}
+            onClick={openPanel}
             className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
           >
             <Info size={15} className="text-fg2" /> 关于
@@ -355,17 +519,6 @@ export function App() {
         results.map((r) => (
           <ResultWindow key={r.id} item={r} dpr={desktop.dpr} onClose={(id) => setResults((prev) => prev.filter((x) => x.id !== id))} onToast={showToast} />
         ))}
-
-      {/* 配置主窗口 */}
-      {showMain && !overlay && (
-        <MainWindow
-          settings={settings}
-          onChange={setSettings}
-          onClose={() => setShowMain(false)}
-          onShot={() => startOverlay('shot')}
-          onLong={() => startOverlay('long')}
-        />
-      )}
 
       {/* 截图覆盖层 */}
       {overlay && desktop && (

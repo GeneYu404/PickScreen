@@ -93,24 +93,67 @@ Windows 上用 LF 无兼容问题，无需改成 CRLF。
 **远端**：用户当前未要求配置。将来要加 remote 或 push，先问；
 force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force`。
 
-## 6. 透明穿透窗口 —— 本项目最容易踩的坑
+## 6. 两个窗口，别再合回去
 
-主窗口**不是普通窗口**，它是一块铺满整块虚拟桌面的透明穿透 webview：
+本项目有**两个** Tauri 窗口，各司其职，不要再合并：
 
-- `main.rs` setup 调 `cover_virtual_desktop()`，把 HWND `SetWindowPos` 到虚拟桌面边界
-  （`capture.rs::virtual_desktop_bounds()`，取 `SM_*VIRTUALSCREEN`，多屏包围盒）
-- 空闲态写 `WS_EX_TRANSPARENT | WS_EX_LAYERED`，让点击 / 滚轮穿透到真实桌面
-- `winapi.rs` 有 60Hz 轮询线程，按鼠标是否落在 `[data-region]` 同步来的交互矩形内动态切换样式
+| label | 尺寸 | 角色 | 样式 |
+| --- | --- | --- | --- |
+| `main` | 820×560 定宽 | 配置面板 | `harden_panel`：不穿透、**不** NOACTIVATE（点它要能获得焦点录快捷键） |
+| `overlay` | `cover_virtual_desktop()` 铺满虚拟桌面 | 抓屏画布 / 覆盖层 / 贴图 / 提示条 / 托盘菜单 | `harden`：空闲态穿透 + NOACTIVATE |
 
-由此产生两条硬性约束：
+**历史**：早期只有一块铺满虚拟桌面的 webview，三种角色共用。这带来一连串问题——
+抓屏必须 hide 整块全屏层（`DwmFlush` + 40ms sleep + 竞态）、60Hz 穿透轮询要同时服务
+「面板要可点」和「覆盖层要穿透」两种冲突需求、`captureSelf` 被迫做成
+「保持全屏窗口 layered 透明 + 冻结轮询」这种自相矛盾的时序。拆窗后这些一并消失：
+「允许截取拾屏自身」现在只需**什么都不做**——面板是块普通窗口，留在原位正好入镜。
 
-1. **`body` 必须保持 `background: transparent`。**
-   任何不透明底色都会把整块 webview 刷成纯色、盖住用户真实桌面。
-   （模拟桌面已删除，不再有「谁负责给 body 上色」的问题——body 恒为透明。）
-2. **浮在用户真实屏幕上的色块必须固定，不能跟随主题。**
-   判据：**该色块背后是本应用的窗口表面，还是用户的桌面？**
+由此产生的硬性约束：
+
+1. **`overlay` 窗口的 `body` 必须保持 `background: transparent`。**
+   它铺满用户真实桌面，任何不透明底色都会刷成纯色、盖住桌面。
+2. **`main` 窗口可以有不透明底色**（`bg-app`），它背后是本应用自己的窗口表面。
+3. **浮在用户真实屏幕上的色块必须固定，不能跟随主题。**
+   判据：**该色块背后是本应用窗口表面，还是用户的桌面？**
    - 桌面之上 → 固定色（覆盖层 `ACCENT = '#2b6cf0'`、坐标/尺寸读数气泡、放大镜、toast 深色条）
    - 本应用窗口之上 → 可主题化（配置面板、截图工具栏、长截图面板、托盘菜单）
+4. **60Hz 穿透轮询只服务 `overlay` 窗口。** `main` 是普通可交互窗口，不参与。
+   `[data-region]` 同步也只从 `overlay` 窗口采集。
+   同一个线程顺带以 **1Hz** 校正 `main` 的样式（`tick % 60`）—— **tao 的 `show()`
+   会重置 exstyle**，把 `harden_panel` 在 show 之前写好的 `WS_EX_TOOLWINDOW` 冲掉，
+   拾屏面板就会在任务栏留下图标。校正必须放在那些 `continue` **之前**：覆盖层不可见时
+   整段会 continue，而那时恰恰也该校正面板。
+5. **`main` 必须是 `transparent: false` 且不带 `WS_EX_LAYERED`。**
+   `transparent: true` 会让 tao 给窗口加 `WS_EX_LAYERED`，而 `body` 恒为 transparent
+   （`overlay` 需要），实色只铺在 `#root` 里 —— 整窗会被 alpha 混合成半透明。
+   底色由 `index.html` 的 `html[data-win="main"]` 规则铺（`on_page_load` 里由 Rust
+   注入标记 + 内联脚本 + `App.tsx` useEffect 三路互为兜底），**从 `html` 这一层开始**
+   才不留缝。
+6. **窗口枚举要排除两个 HWND**（`self_hwnds()`）：`list_windows` / `scroll_at` /
+   `focus_next_window` 都收 `[HWND; 2]`，不能只排除一个。
+   例外：`list_windows` 里「配置面板」不排除而是**设为例外**（跳过 `WS_EX_TOOLWINDOW`
+   过滤），否则「自动识别」永远列不出拾屏自己；覆盖层窗口仍要排除（此刻它刚被
+   `grab_screen` show 出来但 DOM 还没画上抓到的帧，列进去只是个空白候选）。
+   该不该出现交给可见性判断：`capture_self` 关闭时 Rust 已藏了面板，
+   `IsWindowVisible` 为 false 自动跳过。
+7. **抓屏的收尾必须在 Rust 侧做**：前端的 `set_window_visible` 与 `grab_screen` 的
+   invoke 并发，两种到达次序都成立。若「show 先到、grab 后到」，前端 `hasContent`
+   不会重跑，没人把窗口放回来——`grab_screen` 末尾必须自己 `set_window_visible(overlay, true)`。
+8. **`capture_self = true` 时，面板必须在场——由前端负责打开，Rust 只等。**
+   托盘常驻下面板绝大多数时间隐藏；从托盘/热键触发截图时它必然没开，若只是
+   「保持可见」，抓到的画面里根本没有面板，覆盖层升起来后底下空空如也
+   （用户看到的「主界面消失」）。
+   - **Rust 不能代劳** `set_window_visible(main, true)`：那只 show HWND，面板窗口的
+     React 还停在 `showMain=false`，会显示成一片**空白**。
+   - 正确分工：前端在 `captureSelf` 且面板未开时广播 `'show'`，由**面板窗口自己**
+     渲染出 UI；Rust 只轮询 `panel.is_visible()`（上限 1.2s）等它真的上屏。
+9. **抓屏要等两个不同的东西，`DwmFlush` 只管其中一个。**
+   `DwmFlush` 等的是 DWM 合成队列，**等不到** WebView2 提交自己的 DirectComposition
+   表面（另一次异步提交）。所以顺序是：等面板可见 → 等前端 `mark_panel_painted`
+   上报首帧（覆盖 WebView2 冷启动）→ 再留 ~250ms 让 DWM 真的合成上屏 → 才 `BitBlt`。
+   **固定 sleep 猜不准这个时长**，且首次启动的冷启动远大于任何经验值。
+   上报时刻是「一次性」的，所以 `elapsed() >= SETTLE` 在之后永远成立 —— 它只保证
+   「面板画过」，**不保证「面板此刻在屏幕上」**，在场与否要靠第 8 条单独判断。
 
 另：托盘菜单用浅色 `bg-acrylic` 是**对的** —— Windows 11 原生右键菜单本身就是浅色亚克力，
 那是正常窗口表面，不是穿透层。
@@ -148,22 +191,28 @@ Rust 已提供对应命令，不要在前端另写一套：
 
 ## 8. 改动前先核对清单
 
-1. 改到窗口显隐 / 穿透逻辑了吗？→ 见 §3、§5
-2. 动了 `data-region` 属性吗？→ **不能删改**。原生鼠标穿透靠前端每 250ms 用
-   `querySelectorAll('[data-region]')` 同步矩形给 Rust，丢了会导致整窗不可点或不可穿透
-3. 动了 `grab_screen` 的 hide/show 顺序吗？→ 必须**先隐藏 → 抓帧 → 再 show**，
-   顺序反了会把自己拍进去（套娃）。且「隐藏」要**当场生效**：tao 的 `hide()` 只是
-   `PostMessage`，必须再在 HWND 上直接 `ShowWindow`（`winapi::set_shown`），
-   并在 BitBlt 前 `DwmFlush()` 等 DWM 合成完 —— 否则抓到上一帧（覆盖层 45% 黑遮罩），
-   表现是整屏「雾蒙蒙」。详见 [后端方案.md](后端方案.md) §6.7
-4. 动过 `set_window_visible(true)` 吗？→ 必须**先写 `WS_EX_NOACTIVATE` 再 show**：
-   tao 用 `SW_SHOW` 会激活这块铺满虚拟桌面的透明 webview，用户的按键会落进来
-5. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
+1. 改到窗口显隐 / 穿透逻辑了吗？→ 见 §3、§5、**§6（两个窗口）**
+2. 动了 `data-region` 属性吗？→ **不能删改**。原生鼠标穿透靠 `overlay` 窗口每 250ms 用
+   `querySelectorAll('[data-region]')` 同步矩形给 Rust，丢了会导致该区域不可点或不可穿透
+   （`main` 面板窗口不参与，已移除它的 `data-region="panel"`）
+3. 动了 `grab_screen` 的显隐顺序吗？→ 不变式是「**抓帧那一刻两个自有窗口都不挡路**」：
+   - `overlay` 永远先藏（铺满桌面，可见就整块盖住），且要在 HWND 上直接
+     `ShowWindow`（`winapi::set_shown`）才当场生效——tao 的 `hide()` 只是 `PostMessage`
+   - `main` 面板仅在 `capture_self == false` 时藏；开启时**不要藏**，留着正好入镜
+   - 抓完必须在 Rust 侧 `set_window_visible(overlay, true)` 收尾（见 §6 约束 6）
+   - BitBlt 前 `DwmFlush()` 等 DWM 合成完 —— 否则抓到上一帧（覆盖层 45% 黑遮罩），
+     表现是整屏「雾蒙蒙」。详见 [后端方案.md](后端方案.md) §6.7
+4. 动过 `set_window_visible` 吗？→ 现在**必须传 `label`**，两个窗口的 show 前置样式不同：
+   `overlay` 要先钉穿透 + NOACTIVATE（tao 用 `SW_SHOW` 会激活它，用户按键会落进透明层）；
+   `main` 要先钉 `harden_panel`（不穿透、可激活）
+5. 改到窗口枚举吗？→ `list_windows` / `scroll_at` / `focus_next_window` 收的是
+   `[HWND; 2]`，别改回单个
+6. 改到前端文案了吗？→ `index.html` 的 `<title>` / `<meta description>` 也会被 Vite
    内联进产物，**grep 时别只搜 `src/`**
-6. 新逻辑该写前端还是 Rust？→ 见 §6。**先问「它是否需要操作系统的知识」**，
+7. 新逻辑该写前端还是 Rust？→ 见 §7。**先问「它是否需要操作系统的知识」**，
    需要就写 Rust。前端只做纯 canvas 运算
-7. 要暂存/提交吗？→ 见 §4，先确认 `git ls-files -s` 里没有 `120000`
-8. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
+8. 要暂存/提交吗？→ 见 §5，先确认 `git ls-files -s` 里没有 `120000`
+9. 要删文件吗？→ 先问用户；`rm` 走运行时可恢复删除，不要用永久删除命令
 
 ## 9. 验证步骤
 
@@ -188,9 +237,19 @@ $d -match '要确认的文案'      # 确认改动进了产物
 
 `index.html`、`src/**` 都会被 Vite singlefile 内联进 `dist/index.html`，直接从产物 grep 最可靠。
 
+### GUI 行为验证不了时，先建观测点
+
+容器/自动化环境跑不了 GUI 时，**别靠猜**——把运行时真实状态搬进界面，再让用户读一次。
+本项目已有现成例子：「关于」页底部的 `window_diagnostics` 会回报两个窗口真实的
+`GWL_EXSTYLE` 位 + DOM 的 `data-win`。面板半透明那次就是靠它一次定性的
+（`LAYERED=false | DOM=main` 直接排除了 alpha 合成这条线），此前连修四轮都打偏。
+
+同理，**跨窗口 / 时序问题优先用「值已到位」的真实信号**（前端 `mark_panel_painted` 上报、
+Rust 轮询 `panel.is_visible()`），而不是 `sleep(40ms)` 这种猜出来的时长。
+
 ## 10. 设计稿 ≠ 实际代码
 
 [后端方案.md](后端方案.md) 第三节是**原始设计稿**（含 `todo!()` 占位），
-第六节才记录与实际仓库的差异。单窗口模型、抓屏只用 BitBlt（未启用 WGC）、
-`window_detect.rs`/`overlay_win.rs` 已并入 `winapi.rs`、`pin_host.rs` 不存在 ——
-按设计稿找文件会找不到。**改代码前先读第六节。**
+第六节才记录与实际仓库的差异。**双窗口模型**（`main` 面板 + `overlay` 覆盖层，
+见 §6）、抓屏只用 BitBlt（未启用 WGC）、`window_detect.rs`/`overlay_win.rs` 已并入
+`winapi.rs`、`pin_host.rs` 不存在 —— 按设计稿找文件会找不到。**改代码前先读第六节。**

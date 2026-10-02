@@ -15,11 +15,38 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { load } from '@tauri-apps/plugin-store';
 import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart';
 import type { Store } from '@tauri-apps/plugin-store';
 import type { Hotkeys, Settings } from '../types';
+
+/* ---------------- 窗口身份 ---------------- */
+
+/**
+ * 当前 webview 属于哪个窗口：`main`（配置面板，820×560）还是 `overlay`
+ * （铺满虚拟桌面，承载覆盖层 / 贴图 / 提示条 / 托盘菜单）。
+ *
+ * 拆窗之后这是整个前端的分流依据 —— 两个窗口各自只渲染自己该有的东西，
+ * 跨窗口的状态（面板显隐、配置变更）走 Rust 的 `action` 事件广播。
+ * 浏览器预览环境没有窗口概念，一律当作 `main`，行为与拆分前一致。
+ */
+export type WindowLabel = 'main' | 'overlay';
+
+let cachedLabel: WindowLabel | null = null;
+
+export function currentWindowLabel(): WindowLabel {
+  if (cachedLabel) return cachedLabel;
+  if (!isTauriEnv()) return 'main';
+  try {
+    const label = getCurrentWebviewWindow().label;
+    cachedLabel = label === 'overlay' ? 'overlay' : 'main';
+  } catch {
+    cachedLabel = 'main';
+  }
+  return cachedLabel;
+}
 
 /* ---------------- 类型契约（与 Rust 侧一一对应，与方案 A 相同） ---------------- */
 
@@ -107,7 +134,7 @@ export async function viewportCss(): Promise<{ w: number; h: number }> {
     const now = Date.now();
     if (now - lastNudge > 2000) {
       lastNudge = now;
-      void optionalInvoke('renudge');
+      void optionalInvoke('renudge', { label: currentWindowLabel() });
     }
   }
   return { w: Math.min(iw, rw), h: Math.min(ih, rh) };
@@ -255,12 +282,33 @@ export const NativeBridge = {
   },
 
   /**
-   * 窗口整体显隐。空闲（无配置面板 / 无覆盖层 / 无贴图）时隐藏整块 webview，
-   * 让托盘常驻期间不占顶层窗口位；Rust 侧 60Hz 穿透轮询见窗口不可见即休眠。
-   * 覆盖层启动路径不依赖它 —— grab_screen 自己收尾时就会 show。
+   * 窗口整体显隐，按窗口分别驱动：
+   * - `main`：有配置面板时可见，否则藏（托盘常驻期间不占顶层窗口位）。
+   * - `overlay`：有覆盖层 / 贴图 / 提示条 / 托盘菜单时可见，否则藏，
+   *   Rust 侧 60Hz 穿透轮询见窗口不可见即休眠。
+   *
+   * `label` 省略时用「当前窗口自己」，绝大多数调用点只需要这个默认值。
    */
-  async setWindowVisible(visible: boolean): Promise<void> {
-    await optionalInvoke('set_window_visible', { visible });
+  async setWindowVisible(visible: boolean, label: WindowLabel = currentWindowLabel()): Promise<void> {
+    await optionalInvoke('set_window_visible', { label, visible });
+  },
+
+  /**
+   * 上报本窗口首帧已绘制。
+   *
+   * 由面板窗口在双 rAF 后调用（见 App.tsx）。抓屏时 Rust 据此**条件等待** ——
+   * BitBlt 读的是 DWM 合成后的屏幕像素，而 WebView2 提交 DirectComposition 表面
+   * 是另一次异步流程；应用首次启动时这段还包含 WebView2 冷启动，不等就会抓到
+   * 半渲染的中间态。
+   */
+  async markPanelPainted(): Promise<void> {
+    await optionalInvoke('mark_panel_painted');
+  },
+
+  /** 读回窗口在**运行时**真实的扩展样式位（诊断用，见「关于」页） */
+  async windowDiagnostics(label?: WindowLabel): Promise<string> {
+    if (!isTauriEnv()) return '（浏览器预览，无原生窗口）';
+    return (await invoke<string>('window_diagnostics', { label: label ?? currentWindowLabel() })) ?? '';
   },
 
   /* ===== 长截图（拼接器在 Rust 侧，与 A 共用实现） ===== */

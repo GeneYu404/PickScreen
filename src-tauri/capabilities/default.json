@@ -1,9 +1,10 @@
 {
   "identifier": "default",
-  "description": "拾屏 B 默认能力：核心能力 + 官方插件权限（store / dialog / autostart）",
-  "windows": ["main"],
+  "description": "拾屏 B 默认能力：核心能力 + 官方插件权限（store / dialog / autostart）。两个窗口都要绑定：main 是配置面板，overlay 是铺满虚拟桌面的覆盖层。",
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "store:default",
     "dialog:default",
     "autostart:allow-enable",

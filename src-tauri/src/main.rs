@@ -20,7 +20,9 @@ mod tray;
 mod util;
 mod winapi;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use state::SharedState;
 use tauri::Manager;
@@ -43,9 +45,19 @@ struct SaveReq {
     path: String,
 }
 
-fn main_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+/// 配置面板窗口：正常尺寸（820×560）的可交互窗口，整块可点、点它能获得焦点。
+fn panel_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
     app.get_webview_window("main")
-        .ok_or_else(|| "主窗口不存在".to_string())
+        .ok_or_else(|| "配置面板窗口不存在".to_string())
+}
+
+/// 覆盖层窗口：铺满整块虚拟桌面的透明穿透窗，承载截图覆盖层 / 贴图 / 提示条 / 托盘菜单。
+///
+/// 与面板拆成两个窗口，是为了让面板回归「普通窗口」的形态：抓屏时只需藏起一块
+/// 820×560 的小面板，而不是整个铺满虚拟桌面的透明层。
+fn overlay_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    app.get_webview_window("overlay")
+        .ok_or_else(|| "覆盖层窗口不存在".to_string())
 }
 
 fn hwnd_of(win: &tauri::WebviewWindow) -> Result<HWND, String> {
@@ -53,53 +65,123 @@ fn hwnd_of(win: &tauri::WebviewWindow) -> Result<HWND, String> {
     Ok(HWND(raw.0))
 }
 
+/// 两个自有窗口的 HWND：抓屏要避开它们，窗口枚举 / 滚轮代理 / 焦点交还要排除它们。
+/// 取不到时填 null 指针 —— 比较 `contains(&hwnd)` 对 null 不会误伤真实窗口。
+fn self_hwnds(app: &tauri::AppHandle) -> [HWND; 2] {
+    let grab = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.hwnd().ok())
+            .map(|raw| HWND(raw.0))
+            .unwrap_or(HWND(std::ptr::null_mut()))
+    };
+    [grab("main"), grab("overlay")]
+}
+
 /* ---------------- 命令 ---------------- */
 
 /// 抓取整块虚拟桌面。
 ///
-/// 默认路径：先隐藏本窗口（避免把自己拍进去）→ 等 DWM 合成 → 抓帧 → 恢复显示。
+/// 拆成两个窗口之后，抓屏的不变式收敛成一句：**抓帧那一刻，两个自有窗口都不能挡在
+/// 待截桌面前面**。
 ///
-/// `capture_self = true` 走另一条路：窗口保持 `WS_EX_LAYERED` 且**不隐藏**。
-/// 透明区域不参与桌面合成，所以抓到的背景依旧干净，而面板（DOM）本身会被拍进去 ——
-/// 这就是「能否截取本软件自身」的开关。轮询线程在此期间冻结样式（`self_capture`），
-/// 否则它会在抓取途中把窗口切成不透明，整块窗口就盖住了待截的桌面。
+/// - 覆盖层窗口永远要藏：它铺满整块虚拟桌面，一旦可见就整块盖住桌面。
+/// - 配置面板窗口由 `capture_self` 决定去留。开启时**根本不用藏** —— 它现在只是
+///   一块 820×560 的普通窗口，留在原位正好让用户把这块面板也拍进去，桌面其余部分
+///   依旧干净。这正是「允许截取拾屏自身」如今能变干净的原因：不再需要「保持全屏
+///   窗口 layered 透明、同时冻结穿透轮询」这套自相矛盾的时序。
+/// - 关闭时只需藏一块 820×560 的小面板，合成面积比原来小一个量级。
+///
+/// 显隐不交还给本命令：抓完之后面板该关、覆盖层该开，都由前端 `hasContent` 分别驱动
+/// 两个窗口，本命令只保证「抓的那一瞬间画面是干净的」。
 #[tauri::command]
 async fn grab_screen(
     app: tauri::AppHandle,
     capture_self: bool,
 ) -> Result<tauri::ipc::Response, String> {
-    let win = main_window(&app)?;
-    let hwnd = hwnd_of(&win)?;
+    let panel = panel_window(&app)?;
+    let overlay = overlay_window(&app)?;
+    let panel_hwnd = hwnd_of(&panel)?;
+    let overlay_hwnd = hwnd_of(&overlay)?;
     let st = app.state::<SharedState>();
+    // 抓屏期间把「面板是否在场」告诉等待循环：Rust 不自己 show 面板（那只会得到
+    // 一片空白），而是等前端 setShowMain(true) → set_window_visible 走完。
+    let panel_visible = Arc::new(AtomicBool::new(panel.is_visible().unwrap_or(false)));
+
+    // 不依赖前端 hasContent 的时序：React 状态更新与 invoke 并发，抓屏可能跑在覆盖层
+    // show 之前，也可能跑在之后。这里直接钉住「抓屏时覆盖层不可见」。
+    let _ = overlay.hide();
+    winapi::set_shown(overlay_hwnd, false);
 
     let bytes = if capture_self {
-        // 空闲态窗口可能被前端整体隐藏过，先显示出来再抓
-        win.show().map_err(|e| e.to_string())?;
-        st.self_capture.store(true, Ordering::Relaxed);
-        // 不动样式：保持 layered，透明处不参与合成
-        let r = tauri::async_runtime::spawn_blocking(|| {
+        st.overlay.store(true, Ordering::Relaxed);
+
+        // **面板必须在场**，不能指望前端恰好开着它。
+        //
+        // 托盘常驻意味着面板绝大多数时间是隐藏的；从托盘/热键触发的截图时它并不在屏幕
+        // 上，这里若只是「保持可见」，抓到的画面里根本没有它 —— 覆盖层升起来后底下
+        // 空空如也，用户看到的就是「主界面消失」。
+        //
+        // 注意**不能**在这里自己调 `set_window_visible(main, true)`：那只 show HWND，
+        // 面板窗口的 React 仍停在 showMain=false，会显示成一片空白。让前端负责
+        // 打开（它才能把 UI 渲染出来），这里只**等**它真的可见。
+        //
+        // State<'_, T> 借用了 app，不能进 spawn_blocking 的 'static 闭包；
+        // 把真正拥有所有权的 Arc 克隆出来。
+        let painted_slot = st.panel_painted.clone();
+        let r = tauri::async_runtime::spawn_blocking(move || {
+            // 先等面板真的可见（前端收到 'shot' 后会 setShowMain(true) → 触发
+            // set_window_visible）。这一段覆盖「从托盘触发、面板原本隐藏」的主场景。
+            const VISIBLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1200);
+            let t0 = std::time::Instant::now();
+            while !panel_visible.load(Ordering::Relaxed) {
+                if t0.elapsed() >= VISIBLE_DEADLINE {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+
+            // `DwmFlush` 只等 DWM 的合成队列，**等不到** WebView2 提交自己的
+            // DirectComposition 表面 —— 那是另一次异步提交。面板刚 show 时队列里可能
+            // 还没有对应命令，立刻抓会拿到「还没画好」的中间态。
+            //
+            // 双重保险：先等前端上报首帧（覆盖 WebView2 冷启动），再多留一点让 DWM
+            // 真的把它合成上屏；没上报就等到上限，不让抓屏无限阻塞。
+            const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+            const DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+            let started = std::time::Instant::now();
+            loop {
+                let painted = painted_slot
+                    .lock()
+                    .ok()
+                    .and_then(|s| *s)
+                    .map(|t| t.elapsed() >= SETTLE)
+                    .unwrap_or(false);
+                if painted || started.elapsed() >= DEADLINE {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
             winapi::flush_composition();
             capture::grab_virtual()
         })
         .await
         .map_err(|e| e.to_string())?;
-        st.self_capture.store(false, Ordering::Relaxed);
-        st.overlay.store(true, Ordering::Relaxed);
         r?
     } else {
         st.overlay.store(true, Ordering::Relaxed);
-        winapi::set_interactive(hwnd, true);
 
-        // 隐藏必须「当场生效」：tao 的 hide() 只是 PostMessage 到事件循环线程，
-        // 直接在 HWND 上再 ShowWindow 一次，保证抓帧那一刻本窗口已经不在屏幕上。
-        win.hide().map_err(|e| e.to_string())?;
-        winapi::set_shown(hwnd, false);
+        // 隱藏必須「當場生效」：tao 的 hide() 只是 PostMessage 到事件循環線程，
+        // 直接在 HWND 上再 ShowWindow 一次，保證抓幀那一刻這塊面板已經不在屏幕上。
+        // 這裡刻意**不恢復**：前端 startOverlay 已經把面板收起來，恢復反而會讓它
+        // 在覆蓋層弹出時又冒出來。
+        let _ = panel.hide();
+        winapi::set_shown(panel_hwnd, false);
 
         let r = tauri::async_runtime::spawn_blocking(|| {
-            // 等 DWM 把这一帧合成完再抓。少了这一步：刚打断上一次截图（Esc/右键）就再按热键，
-            // 屏幕上还留着上一帧的 45% 黑遮罩，BitBlt 把它一起拍进来 → 整屏发灰。
+            // 等 DWM 把這一幀合成完再抓。少了這一步：剛打斷上一次截圖（Esc/右鍵）就再按熱鍵，
+            // 屏幕上還留著上一幀的 45% 黑遮罩，BitBlt 把它一起拍進來 → 整屏發灰。
             winapi::flush_composition();
-            // 兜底：等 WebView2 的 DirectComposition 表面彻底交还
+            // 兜底：等 WebView2 的 DirectComposition 表面徹底交還
             std::thread::sleep(std::time::Duration::from_millis(40));
             winapi::flush_composition();
             capture::grab_virtual()
@@ -109,17 +191,70 @@ async fn grab_screen(
         r
     };
 
-    win.show().map_err(|e| e.to_string())?;
-    let _ = win.set_focus();
+    // 抓完之后把覆盖层窗口放回来。必须在这里做，不能指望前端：
+    // 前端 `setOverlay` 触发的 set_window_visible 与本命令的 invoke 是并发的，
+    // 两种到达次序都成立 ——
+    //   show 先到 → 本命令藏起来抓屏，抓完没人再 show（hasContent 没变化，不重跑）→ 卡在隐藏
+    //   本命令先到 → 藏（本来就是隐藏的）→ 抓 → 前端 show 正常
+    // 第一种次序下只有这里能救回来，而它同时也是语义上正确的一步：抓完屏就该显示覆盖层。
+    set_window_visible(app.clone(), "overlay".to_string(), true);
+
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 窗口样式诊断：把 `GWL_EXSTYLE` 的关键位回报给前端显示。
+///
+/// 存在的意义：面板半透明这件事已经反复修了几轮，每次都在「猜哪个样式位没生效」。
+/// `transparent: false`、`harden_panel` 清 `WS_EX_LAYERED` 都做过，用户仍看到半透明。
+/// 与其继续猜，不如把**运行时真实的位**摆到界面上 —— 一次就能定性。
+#[tauri::command]
+fn window_diagnostics(app: tauri::AppHandle, label: String) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT,
+    };
+    let Some(win) = app.get_webview_window(&label) else {
+        return format!("{label}: 窗口不存在");
+    };
+    let Ok(h) = hwnd_of(&win) else {
+        return format!("{label}: 取 HWND 失败");
+    };
+    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) };
+    let bit = |m: windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE| {
+        (ex & m.0 as isize) != 0
+    };
+    format!(
+        "{label} EX=0x{:X} | LAYERED={} TRANSPARENT={} NOACTIVATE={} TOOLWINDOW={}",
+        ex,
+        bit(WS_EX_LAYERED),
+        bit(WS_EX_TRANSPARENT),
+        bit(WS_EX_NOACTIVATE),
+        bit(WS_EX_TOOLWINDOW),
+    )
+}
+
+/// 面板 webview 首帧绘制完成（前端双 rAF 后上报），供抓屏做条件等待。
+#[tauri::command]
+fn mark_panel_painted(app: tauri::AppHandle) {
+    let st = app.state::<SharedState>();
+    if let Ok(mut slot) = st.panel_painted.lock() {
+        *slot = Some(std::time::Instant::now());
+    }
 }
 
 /// 枚举真实可见窗口（Z 序，物理像素，前端负责换算 CSS）
 #[tauri::command]
 fn list_windows(app: tauri::AppHandle) -> Result<Vec<winapi::WindowRect>, String> {
-    let win = main_window(&app)?;
-    let hwnd = hwnd_of(&win)?;
-    Ok(winapi::list_windows(hwnd))
+    // 只把**配置面板**当作可识别的自有窗口。覆盖层窗口不能算：grab_screen 收尾时
+    // 刚把它 show 出来，而前端这会儿还没把抓到的帧画上去（setScreenImage 在
+    // grabScreen 之后才 await），列进候选等于给用户一个空白窗口。留 null 让它照常
+    // 走 WS_EX_TOOLWINDOW 过滤被跳过。
+    let panel = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|raw| HWND(raw.0))
+        .unwrap_or(HWND(std::ptr::null_mut()));
+    Ok(winapi::list_windows([panel, HWND(std::ptr::null_mut())]))
 }
 
 /// 同步「参与穿透切换」的矩形（贴图 / 设置面板 / 托盘菜单）
@@ -135,30 +270,36 @@ fn end_overlay(app: tauri::AppHandle) {
     app.state::<SharedState>()
         .overlay
         .store(false, Ordering::Relaxed);
-    if let Ok(hwnd) = main_window(&app).and_then(|w| hwnd_of(&w)) {
-        winapi::focus_next_window(hwnd);
-    }
+    winapi::focus_next_window(self_hwnds(&app));
 }
 
-/// 窗口整体显隐：空闲（无面板 / 无覆盖层 / 无贴图 / 无提示条）时前端调 hide，
-/// 让托盘常驻期间不占用顶层窗口位，穿透轮询线程也随之休眠。
+/// 窗口整体显隐，由前端按各自的内容分别驱动：
+/// - `label = "main"`：配置面板。无面板时藏，托盘常驻期间不占顶层窗口位。
+/// - `label = "overlay"`：覆盖层。无覆盖层 / 无贴图 / 无提示条 / 无托盘菜单时藏，
+///   60Hz 穿透轮询也随之休眠。
+///
+/// show 之前必须先把该窗口的样式钉好：tao 用的是 SW_SHOW，会顺手激活窗口，而
+/// 样式必须在 `ShowWindow` 之前写好，事后补写已经来不及。
 #[tauri::command]
-fn set_window_visible(app: tauri::AppHandle, visible: bool) {
-    let Ok(win) = main_window(&app) else { return };
+fn set_window_visible(app: tauri::AppHandle, label: String, visible: bool) {
+    let Some(win) = app.get_webview_window(&label) else { return };
     let res = if visible {
-        // 先把空闲态样式（穿透 + WS_EX_NOACTIVATE）钉好再 show：tao 用的是 SW_SHOW，
-        // 会顺手激活窗口，而这块 webview 铺满整块虚拟桌面 —— 抢到前台后用户的按键
-        // 会落进透明窗口（例如截图后的「已复制」提示停留的 2.6s）。
-        // NOACTIVATE 必须在 ShowWindow 之前写好，事后补写已经来不及。
         if let Ok(h) = hwnd_of(&win) {
-            winapi::set_interactive(h, false);
+            if label == "main" {
+                // 面板是普通窗口：整块可命中、点它该获得焦点去录快捷键。
+                winapi::harden_panel(h);
+            } else {
+                // 覆盖层铺满整块虚拟桌面：先钉穿透 + NOACTIVATE，抢到前台后用户的
+                // 按键不会落进透明窗口（例如截图后的「已复制」提示停留的 2.6s）。
+                winapi::set_interactive(h, false);
+            }
         }
         win.show()
     } else {
         win.hide()
     };
     if let Err(e) = res {
-        eprintln!("[window] 设置显隐失败 (visible={visible}): {e}");
+        eprintln!("[window] 设置显隐失败 ({label}, visible={visible}): {e}");
     }
 }
 
@@ -193,10 +334,7 @@ fn save_png(req: SaveReq) -> Result<String, String> {
 /// 把滚轮代理给选区下方的真实窗口，返回实际滚动距离（物理像素；0 = 下方无目标）
 #[tauri::command]
 fn scroll_region(app: tauri::AppHandle, x: i32, y: i32, dy: i32) -> i32 {
-    let Ok(hwnd) = main_window(&app).and_then(|w| hwnd_of(&w)) else {
-        return 0;
-    };
-    winapi::scroll_at(x, y, dy, hwnd)
+    winapi::scroll_at(x, y, dy, self_hwnds(&app))
 }
 
 /// 前端检测到布局口径异常时调用：按「物理窗口/真实DPI」重下 WebView2 bounds。
@@ -204,11 +342,11 @@ fn scroll_region(app: tauri::AppHandle, x: i32, y: i32, dy: i32) -> i32 {
 /// wry 再乘真实 DPI 得 controller = 物理窗口尺寸，布局视口随之回到
 /// 物理/缩放 的健康值；幂等，可重复调用。
 #[tauri::command]
-fn renudge(app: tauri::AppHandle) {
+fn renudge(app: tauri::AppHandle, label: String) {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-    let Ok(win) = main_window(&app) else { return };
+    let Some(win) = app.get_webview_window(&label) else { return };
     let Some(h) = hwnd_of(&win).ok() else { return };
     let (pw, ph, scale) = unsafe {
         let mut r = windows::Win32::Foundation::RECT::default();
@@ -218,10 +356,9 @@ fn renudge(app: tauri::AppHandle) {
         let dpi = GetDpiForWindow(h).max(96);
         ((r.right - r.left) as f64, (r.bottom - r.top) as f64, dpi as f64 / 96.0)
     };
-    let _ = win.as_ref().set_bounds(tauri::Rect {
-        position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, 0)),
-        size: tauri::Size::Logical(tauri::LogicalSize::new(pw / scale, ph / scale)),
-    });
+    // 只改尺寸，不动位置：拆窗之前这块 webview 铺满整个 HWND，把 bounds 归到 (0,0)
+    // 是安全的；现在 `main` 是独立的居中窗口，沿用 set_bounds 会把它甩到屏幕左上角。
+    let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(pw / scale, ph / scale)));
 }
 
 
@@ -238,16 +375,29 @@ fn main() {
 
     tauri::Builder::default()
         .manage(SharedState::new())
+        // 每次页面加载完成时给面板窗口注入不透明标记。
+        //
+        // 为什么必须挂在 on_page_load 上而不是 setup 里：setup 执行时 webview 往往还在
+        // 加载 index.html，此刻 eval 的话 `document.documentElement` 尚不存在，脚本
+        // 直接失效——面板就一直是透明的。「加载完成」才是能安全改 DOM 的时刻。
+        //
+        // 另有两条互不依赖的兜底：index.html 的内联脚本（React 之前）与 App.tsx 的
+        // useEffect（React 挂载后）。三者任一生效即可，不必指望另外两个。
+        .on_page_load(|webview, _payload| {
+            if webview.label() == "main" {
+                let _ = webview.eval(
+                    "document.documentElement.setAttribute('data-win','main');\
+                     try{document.body.style.background='var(--bg)'}catch(e){}",
+                );
+            }
+        })
         // 单例：必须注册在所有其它插件之前。
-        // 本应用的主窗口是铺满虚拟桌面的透明穿透窗，第二个实例会叠一层上去、
-        // 并且抢不到全局热键（hotkey.rs 里注册失败是静默忽略的），用户却毫无提示。
-        // 这里把第二次启动转成「唤起已有实例的配置面板」，与托盘菜单的 show 同一通道。
+        // 本应用常驻托盘并占着全局热键，第二个实例会抢不到热键
+        // （hotkey.rs 里注册失败是静默忽略的），用户却毫无提示。
+        // 这里把第二次启动转成「唤起已有实例的配置面板」。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             use tauri::Emitter;
-            // 必须走 set_window_visible(true) 而不是裸 win.show()：
-            // 它会先把 NOACTIVATE 钉好再 show，裸 show 会被 tao 的 SW_SHOW 顺手激活，
-            // 抢到前台后用户的按键会落进透明窗口。
-            set_window_visible(app.clone(), true);
+            set_window_visible(app.clone(), "main".to_string(), true);
             let _ = app.emit("action", "show");
         }))
         // 官方插件（前端 JS 也使用 store / dialog）
@@ -270,16 +420,39 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             let shared = app.state::<SharedState>().inner().clone();
-            let win = app
-                .get_webview_window("main")
-                .ok_or_else(|| "主窗口不存在".to_string())?;
-            let hwnd = hwnd_of(&win)?;
 
-            // 把窗口铺满整块虚拟桌面（物理像素），并加固样式
-            winapi::cover_virtual_desktop(hwnd);
-            winapi::harden(hwnd);
+            // 面板窗口：正常尺寸（820×560），整块可点、点它能获得焦点。
+            let panel = app
+                .get_webview_window("main")
+                .ok_or_else(|| "配置面板窗口不存在".to_string())?;
+            let panel_hwnd = hwnd_of(&panel)?;
+            winapi::harden_panel(panel_hwnd);
+            // 面板必须**不透明**，而它承载的页面里 body 恒为 transparent（overlay 窗口
+            // 铺满用户真实桌面，全靠它）。这里由 Rust 直接往 webview 注入标记，让
+            // index.html 的 `html[data-win="main"]` 规则给整页铺实色。
+            //
+            // 为什么不用前端读窗口 label：那条路要么依赖 Tauri 的内部对象
+            // （`__TAURI_INTERNALS__` 路径随版本变，赌它读不到就退化成透明，
+            // 正是之前面板一直是半透明的原因），要么受 React 挂载时机限制。
+            // 由 Rust 在窗口就绪后主动注入最稳。页面自身的内联脚本与
+            // App.tsx 的 useEffect 各再兜一次底，三条路互不依赖。
+            let _ = panel.as_ref().eval(
+                "document.documentElement.setAttribute('data-win','main');\
+                 try{document.body.style.background='var(--bg)'}catch(e){}",
+            );
+
+            // 覆盖层窗口：铺满整块虚拟桌面（物理像素），并加固样式。
+            // 60Hz 穿透轮询只服务它 —— 贴图 / 托盘菜单需要「哪里可点、哪里穿过」，
+            // 面板窗口是普通可交互窗口，不参与这套逻辑。
+            let overlay = app
+                .get_webview_window("overlay")
+                .ok_or_else(|| "覆盖层窗口不存在".to_string())?;
+            let overlay_hwnd = hwnd_of(&overlay)?;
+            winapi::cover_virtual_desktop(overlay_hwnd);
+            winapi::harden(overlay_hwnd);
             winapi::start_passthrough_thread(
-                hwnd,
+                overlay_hwnd,
+                panel_hwnd,
                 shared.overlay.clone(),
                 shared.self_capture.clone(),
                 winapi::PassthroughRegions(shared.regions.clone()),
@@ -289,13 +462,16 @@ fn main() {
             // 默认热键先注册上（前端加载完配置后会 syncHotkeys 覆盖）
             hotkey::apply(&handle)?;
 
-            // 不调用 win.show()：窗口保持隐藏，托盘常驻。
-            // 前端在「有东西要渲染」（配置面板 / 截图覆盖层 / 贴图）时才调 set_window_visible。
+            // 两个窗口都保持隐藏，托盘常驻。
+            // 前端按各自的内容分别调 set_window_visible：面板出「有面板」，
+            // 覆盖层出「有覆盖层 / 贴图 / 提示条 / 托盘菜单」。
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             grab_screen,
             list_windows,
+            window_diagnostics,
+            mark_panel_painted,
             sync_pin_regions,
             end_overlay,
             set_window_visible,

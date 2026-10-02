@@ -1,8 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Settings2, Crop, ScrollText, Keyboard, Info, X, Minus, Pin } from 'lucide-react';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import type { Settings, Hotkeys, OverlayAction } from '../types';
 import { comboFromEvent, hotkeyCapture } from '../utils/hotkey';
-import { viewportCss, NativeBridge } from '../bridge/tauri';
+import { isTauriEnv, NativeBridge } from '../bridge/tauri';
 import { APP_NAME, APP_NAME_EN, APP_VERSION } from '../brand';
 import { Kbd, Segmented, Slider, Toggle as ToggleSwitch } from './ui/Controls';
 
@@ -12,6 +13,8 @@ interface Props {
   onClose: () => void;
   onShot: () => void;
   onLong: () => void;
+  /** 拖动失败等异常要能让用户看见，否则「拖不动」和「没点对地方」无法区分 */
+  onToast?: (msg: string) => void;
 }
 
 type Tab = 'general' | 'shot' | 'long' | 'keys' | 'about';
@@ -134,44 +137,43 @@ const HotkeyField: React.FC<{ value: string; onChange: (v: string) => void; disa
   );
 };
 
-export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Props) {
+export function MainWindow({ settings, onChange, onClose, onShot, onLong, onToast }: Props) {
   const [tab, setTab] = useState<Tab>('general');
   /** 自启动开关的「写系统」中转态：写失败时回滚设置并提示 */
   const [autoStartBusy, setAutoStartBusy] = useState(false);
-  const WIN_W = 820;
-  const WIN_H = 560;
-  const [pos, setPos] = useState({
-    x: Math.max(8, (window.innerWidth - WIN_W) / 2),
-    y: Math.max(8, (window.innerHeight - WIN_H) / 2 - 24),
-  });
-  const [size, setSize] = useState({ w: WIN_W, h: WIN_H });
-  const dragRef = useRef<{ dx: number; dy: number } | null>(null);
+  /** 两个窗口在运行时的真实扩展样式位（「关于」页显示，诊断用） */
+  const [diag, setDiag] = useState('');
 
-  /* 视口变化（含 DPI / 远程会话缩放变化）后把面板重新收进可视区：
-     初始居中值可能算自旧视口，尺寸/位置都会随 resize 校正，避免面板被裁出屏幕 */
   useEffect(() => {
-    const fit = () => {
-      // viewportCss = OS 物理尺寸/dpr 的真值：WebView2 布局口径说谎时仍能正确收拢
-      void viewportCss().then(({ w: iw, h: ih }) => {
-        const w = Math.min(WIN_W, Math.max(240, iw - 16));
-        const h = Math.min(WIN_H, Math.max(200, ih - 16));
-        setSize((s) => (s.w === w && s.h === h ? s : { w, h }));
-        setPos((p) => {
-          const x = Math.max(8, Math.min(p.x, iw - w - 8));
-          const y = Math.max(8, Math.min(p.y, ih - h - 8));
-          return x === p.x && y === p.y ? p : { x, y };
-        });
-      });
-    };
-    fit();
-    window.addEventListener('resize', fit);
-    // WebView2 在 DPI / 远程会话缩放切换时可能漏发 resize，轮询兜底校正
-    const id = window.setInterval(fit, 400);
+    if (tab !== 'about') return;
+    let alive = true;
+    // 一并回报 DOM 侧的 data-win：不透明靠它生效，它若没设上，面板必然是半透明的。
+    const dom = document.documentElement.getAttribute('data-win') || '未设置(!)';
+    void Promise.all([
+      NativeBridge.windowDiagnostics('main'),
+      NativeBridge.windowDiagnostics('overlay'),
+    ]).then((parts) => {
+      if (alive) setDiag(`DOM=${dom}　|　${parts.join('　|　')}`);
+    });
     return () => {
-      window.removeEventListener('resize', fit);
-      window.clearInterval(id);
+      alive = false;
     };
-  }, []);
+  }, [tab]);
+
+  /**
+   * 标题栏拖动窗口。
+   *
+   * 走**显式 JS API** 而不是只挂 `data-tauri-drag-region`：自动标记那条路一旦被
+   * 冒泡链上任何一环 `stopPropagation` 截断就静默失效，界面上和「没点对地方」
+   * 完全无法区分。这里显式调用并把失败抛成提示条，权限缺失之类的问题会立刻暴露。
+   * 按钮容器自己 stopPropagation，点最小化/关闭不会误触发拖动。
+   */
+  const startDrag = useCallback(() => {
+    if (!isTauriEnv()) return;
+    void getCurrentWebviewWindow()
+      .startDragging()
+      .catch((err: unknown) => onToast?.(`无法拖动窗口：${String(err)}`));
+  }, [onToast]);
 
   /**
    * 自启动开关的初始值以**系统真实状态**为准，而不是 settings 里的缓存：
@@ -188,23 +190,6 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
     };
     // 仅在挂载时读一次；后续由 toggleAutoStart 写系统后自行维持
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const move = (e: MouseEvent) => {
-      if (!dragRef.current) return;
-      setPos({
-        x: Math.max(-WIN_W + 120, Math.min(window.innerWidth - 120, e.clientX - dragRef.current.dx)),
-        y: Math.max(0, Math.min(window.innerHeight - 60, e.clientY - dragRef.current.dy)),
-      });
-    };
-    const up = () => (dragRef.current = null);
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
-    return () => {
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
-    };
   }, []);
 
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) => onChange({ ...settings, [k]: v });
@@ -252,17 +237,15 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
 
   return (
     <div
-      className="absolute z-40 flex flex-col bg-app rounded-lg overflow-hidden border border-stroke-strong shadow-window animate-panel-in"
-      data-region="panel"
-      style={{ left: pos.x, top: pos.y, width: size.w, height: size.h }}
+      className="absolute inset-0 z-40 flex flex-col bg-app overflow-hidden animate-panel-in"
       onMouseDown={(e) => e.stopPropagation()}
     >
-      {/* 标题栏 */}
+      {/* 标题栏：显式调 startDragging 拖动窗口。
+          面板已经是独立的 820×560 窗口，不再像从前那样在铺满虚拟桌面的 webview 里
+          自己算 pos / size 自己拖 —— 那套逻辑连同 fit 校正一起删掉了。 */}
       <div
         className="h-10 flex items-center justify-between pl-3 bg-card border-b border-stroke shrink-0 cursor-default"
-        onMouseDown={(e) => {
-          dragRef.current = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
-        }}
+        onMouseDown={startDrag}
       >
         <div className="flex items-center gap-2">
           <AppLogo size={18} />
@@ -550,6 +533,11 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong }: Prop
                 长截图可自动识别内容并拼接成一张长图；贴图把截图钉在屏幕最前用于对照录入。
               </p>
               <div className="mt-4 text-[11.5px] text-fg3">所有图片仅在本机处理，不上传任何数据。</div>
+              {/* 运行时窗口样式诊断：面板半透明排查了几轮都靠猜，
+                  这里把真实的 EXSTYLE 摆出来，一次就能定性哪个位没生效。 */}
+              <div className="mt-4 w-full text-[10.5px] font-mono text-fg3 break-all select-text">
+                诊断：{diag || '读取中…'}
+              </div>
             </div>
           )}
         </div>

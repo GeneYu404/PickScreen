@@ -14,6 +14,20 @@
       {
         "label": "main",
         "title": "拾屏",
+        "width": 820,
+        "height": 560,
+        "decorations": false,
+        "transparent": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "visible": false,
+        "center": true
+      },
+      {
+        "label": "overlay",
+        "title": "",
         "width": 1280,
         "height": 800,
         "decorations": false,
@@ -23,7 +37,7 @@
         "skipTaskbar": true,
         "shadow": false,
         "visible": false,
-        "center": true
+        "focus": false
       }
     ],
     "security": {

@@ -18,7 +18,8 @@ use serde::Deserialize;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, EnumWindows, GetCursorPos, GetWindow, GetWindowTextLengthW,
@@ -73,11 +74,6 @@ pub fn cover_virtual_desktop(hwnd: HWND) {
     }
 }
 
-/// 窗口样式加固：初始为穿透态（show 前调用一次，此后由轮询线程每帧钉住）
-pub fn harden(hwnd: HWND) {
-    ensure_styles(hwnd, true, true);
-}
-
 /// 同步设置整块窗口的显隐。
 ///
 /// tao 的 `hide()/show()` 只是给事件循环线程 `PostMessage`（`execute_in_thread`），
@@ -102,17 +98,26 @@ pub fn flush_composition() {
 }
 
 /// 读-比-写地修正「由我们负责」的样式位，其余位原样保留。
-/// 穿透态把 WS_EX_TRANSPARENT 与 WS_EX_LAYERED 成对写入（tao 官方
-/// `set_ignore_cursor_events` 的同款组合）；恒常补 WS_EX_TOOLWINDOW、
-/// 清 WS_EX_APPWINDOW，抵御 tao 样式重建对手动位的冲刷。
-fn ensure_styles(hwnd: HWND, transparent: bool, noactivate: bool) {
+///
+/// 三个位彼此独立，因为它们服务的窗口已经拆开：
+/// - `passthrough`：`WS_EX_TRANSPARENT`，鼠标穿透（空闲态 / 贴图区）
+/// - `layered`：`WS_EX_LAYERED`，per-pixel alpha 合成（WebView2 透明背景必需）
+/// - `noactivate`：`WS_EX_NOACTIVATE`，不抢前台
+///
+/// 恒常补 `WS_EX_TOOLWINDOW`、清 `WS_EX_APPWINDOW`，抵御 tao 样式重建对手动位的冲刷。
+fn ensure_styles_ex(hwnd: HWND, passthrough: bool, layered: bool, noactivate: bool) {
     unsafe {
         let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let mut ex = (cur | (WS_EX_TOOLWINDOW.0 as isize)) & !(WS_EX_APPWINDOW.0 as isize);
-        if transparent {
-            ex |= (WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as isize;
+        if passthrough {
+            ex |= WS_EX_TRANSPARENT.0 as isize;
         } else {
-            ex &= !((WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as isize);
+            ex &= !(WS_EX_TRANSPARENT.0 as isize);
+        }
+        if layered {
+            ex |= WS_EX_LAYERED.0 as isize;
+        } else {
+            ex &= !(WS_EX_LAYERED.0 as isize);
         }
         if noactivate {
             ex |= WS_EX_NOACTIVATE.0 as isize;
@@ -125,29 +130,74 @@ fn ensure_styles(hwnd: HWND, transparent: bool, noactivate: bool) {
     }
 }
 
+/// 穿透 + 保留 LAYERED + 不抢前台：覆盖层窗口的空闲态（贴图 / 托盘菜单）。
+pub fn harden(hwnd: HWND) {
+    ensure_styles_ex(hwnd, true, true, true);
+}
+
+/// 面板窗口：正常尺寸的标准不透明窗口，整块区域都要能点、也能激活。
+///
+/// **刻意不保留 `WS_EX_LAYERED`**。它是一块铺满自身内容的不透明面板，走 alpha 合成
+/// 只会让整窗连同 `body` 的 transparent 被 DWM 混合出一层「蒙了纱」的观感 —— 实色
+/// 底色反而比预期更透。关掉 layered 后它是标准窗口（`tauri.conf.json` 里
+/// `transparent: false`），不再需要任何 alpha 配合。
+pub fn harden_panel(hwnd: HWND) {
+    ensure_styles_ex(hwnd, false, false, false);
+    // 圆角交给 DWM：窗口改成不透明后，CSS 的 rounded-lg 已经无法裁到窗口边缘
+    //（没有 alpha 就没有「圆角外透明」这回事）。DWMWA_WINDOW_CORNER_PREFERENCE
+    // 让 DWM 自己在物理窗口上切圆角，Win11 原生观感，且不受 tao 样式重建影响。
+    // 取不到（非 Win11 / 旧 build）就静默跳过，矩形窗口仍可用。
+    unsafe {
+        let pref: i32 = 2; // DWMWCP_ROUND
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&pref as *const i32) as *const std::ffi::c_void,
+            size_of::<i32>() as u32,
+        );
+    }
+}
+
 /// 覆盖层模式开关：true = 强制可命中可聚焦；false = 交还给空闲态样式
 /// （穿透 + 不抢焦点，等价于 `harden`，写出来是为了让两个方向都不留静默 no-op）
 pub fn set_interactive(hwnd: HWND, interactive: bool) {
-    ensure_styles(hwnd, !interactive, !interactive);
+    ensure_styles_ex(hwnd, !interactive, !interactive, !interactive);
 }
 
-/// 启动 60Hz 穿透状态轮询线程
+/// 启动 60Hz 穿透状态轮询线程（同时顺带维护配置面板窗口的样式）
 ///
 /// 窗口隐藏时整段跳过：此时 webview 不渲染任何东西，穿透样式没有作用对象。
 /// `self_capture`（截取本软件自身）期间同样冻结：这一路径要保持 WS_EX_LAYERED
 /// 让透明区域不参与合成，被本线程切成不透明就等于拿自己的窗口盖住待截的桌面。
+///
+/// 顺带维护 `panel` 是因为 **tao 的 `show()` 会重置 exstyle**：`harden_panel` 在
+/// show 之前写好的 `WS_EX_TOOLWINDOW` 会被冲掉，拾屏面板就会在任务栏留下一个图标
+/// （运行时诊断实测 `main EX` 里 `TOOLWINDOW=false` 且带 `APPWINDOW`）。
+/// 与其另开一个线程，不如挂在这里：1Hz 一次即可，不必跟覆盖层一样 60Hz。
 pub fn start_passthrough_thread(
     hwnd: HWND,
+    panel: HWND,
     overlay: std::sync::Arc<AtomicBool>,
     self_capture: std::sync::Arc<AtomicBool>,
     regions: PassthroughRegions,
 ) {
     // HWND 内部是裸指针（非 Send），以 isize 携带进线程
     let hwnd_raw = hwnd.0 as isize;
+    let panel_raw = panel.0 as isize;
     std::thread::spawn(move || {
         let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+        let panel = HWND(panel_raw as *mut std::ffi::c_void);
+        let mut tick: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_millis(16));
+            tick = tick.wrapping_add(1);
+
+            // 面板样式维护：1Hz，且要放在下面那些 `continue` **之前** —— 覆盖层不可见时
+            // 整段会 continue 掉，那时恰恰也该顺带校正面板。面板隐藏时跳过，不去动它。
+            if tick % 60 == 0 && !panel.0.is_null() && unsafe { IsWindowVisible(panel) }.as_bool() {
+                harden_panel(panel);
+            }
+
             if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 continue;
             }
@@ -170,7 +220,7 @@ pub fn start_passthrough_thread(
                 }
             };
             // 每帧都校正：tao 的样式重建会随时冲掉手动位，只在状态变化时写一次会丢
-            ensure_styles(hwnd, want_t, want_n);
+            ensure_styles_ex(hwnd, want_t, want_t, want_n);
         }
     });
 }
@@ -182,22 +232,30 @@ pub struct PassthroughRegions(pub std::sync::Arc<std::sync::Mutex<Vec<Region>>>)
 /* ---------------- 真实窗口枚举 ---------------- */
 
 struct ListData {
-    exclude: HWND,
+    /// 自有窗口（配置面板 + 覆盖层）。
+    ///
+    /// 它们**不再被排除**，否则「自动识别」永远列不出拾屏自己 —— 而开着面板截一张
+    /// 含拾屏界面的图正是 `capture_self` 的用途。这里的语义与 `scroll_at` /
+    /// `focus_next_window` 里的 `excludes` 相反：那两处必须排除自己（不能把滚轮
+    /// 滚给自己、不能把焦点交还给自己）。
+    self_windows: [HWND; 2],
     out: Vec<WindowRect>,
 }
 
 unsafe extern "system" fn enum_list_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         let data = &mut *(lparam.0 as *mut ListData);
-        if hwnd == data.exclude {
-            return BOOL(1);
-        }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             return BOOL(1);
         }
-        // 工具窗口（含我们自己、任务栏、悬浮面板）
+        // 工具窗口（任务栏、悬浮层、别的应用的工具窗）通常不是截图目标。
+        // 但**我们自己的两个窗口是例外**：`ensure_styles_ex` 恒常给它们写
+        // WS_EX_TOOLWINDOW，照常过滤就会让拾屏自己永远识别不到。
+        // 至于「该不该出现」交给可见性判断：capture_self 关闭时 Rust 已把面板藏了，
+        // IsWindowVisible 为 false 自动跳过；开启时它就该作为候选浮在列表里。
+        let is_self = data.self_windows.contains(&hwnd);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if ex & (WS_EX_TOOLWINDOW.0 as isize) != 0 {
+        if !is_self && ex & (WS_EX_TOOLWINDOW.0 as isize) != 0 {
             return BOOL(1);
         }
         // 被 DWM 遮挡挂起的窗口（UWP 后台等）
@@ -265,10 +323,10 @@ unsafe fn window_title(hwnd: HWND) -> String {
     }
 }
 
-/// 枚举真实可见窗口（Z 序从上到下）
-pub fn list_windows(exclude: HWND) -> Vec<WindowRect> {
+/// 枚举真实可见窗口（Z 序从上到下），**包含拾屏自己的窗口**（见 `ListData` 注释）
+pub fn list_windows(self_windows: [HWND; 2]) -> Vec<WindowRect> {
     let mut data = ListData {
-        exclude,
+        self_windows,
         out: Vec::new(),
     };
     unsafe {
@@ -283,7 +341,7 @@ pub fn list_windows(exclude: HWND) -> Vec<WindowRect> {
 /* ---------------- 滚轮代理 ---------------- */
 
 struct PointData {
-    exclude: HWND,
+    excludes: [HWND; 2],
     point: POINT,
     found: HWND,
 }
@@ -291,7 +349,7 @@ struct PointData {
 unsafe extern "system" fn enum_point_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         let data = &mut *(lparam.0 as *mut PointData);
-        if hwnd == data.exclude {
+        if data.excludes.contains(&hwnd) {
             return BOOL(1);
         }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
@@ -327,13 +385,13 @@ unsafe extern "system" fn enum_point_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 /// 把滚轮滚动代理给 (x, y) 之下的真实窗口。
 /// 返回请求的滚动距离（物理像素）；返回 0 表示该点下方没有目标窗口。
-pub fn scroll_at(x: i32, y: i32, dy: i32, exclude: HWND) -> i32 {
+pub fn scroll_at(x: i32, y: i32, dy: i32, excludes: [HWND; 2]) -> i32 {
     // 前端只下发向下滚动；负数/零直接忽略
     if dy <= 0 {
         return 0;
     }
     let mut data = PointData {
-        exclude,
+        excludes,
         point: POINT { x, y },
         found: HWND(std::ptr::null_mut()),
     };
@@ -368,14 +426,18 @@ pub fn scroll_at(x: i32, y: i32, dy: i32, exclude: HWND) -> i32 {
     }
 }
 
-/// 覆盖层结束时把键盘焦点交还给下层窗口，避免继续吞按键
-pub fn focus_next_window(exclude: HWND) {
+/// 覆盖层结束时把键盘焦点交还给下层窗口，避免继续吞按键。
+///
+/// 从 Z 序顶端往下找，跳过两个自有窗口（配置面板 + 覆盖层）——原来的实现是从
+/// 「当前这个窗口的下一个」起算，现在窗口有两个，起点不再是可靠的参照物，
+/// 直接从 HWND_TOP 遍历更稳，也天然覆盖「面板在覆盖层之上」这种次序。
+pub fn focus_next_window(excludes: [HWND; 2]) {
     unsafe {
-        let mut cur = GetWindow(exclude, GW_HWNDNEXT).unwrap_or(HWND(std::ptr::null_mut()));
+        let mut cur = GetWindow(HWND_TOP, GW_HWNDNEXT).unwrap_or(HWND(std::ptr::null_mut()));
         let mut guard = 0;
         while !cur.0.is_null() && guard < 64 {
             guard += 1;
-            if IsWindowVisible(cur).as_bool() {
+            if !excludes.contains(&cur) && IsWindowVisible(cur).as_bool() {
                 let mut cloaked: u32 = 0;
                 let _ = DwmGetWindowAttribute(
                     cur,
