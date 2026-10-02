@@ -124,19 +124,17 @@ const TbBtn: React.FC<{
   onClick: () => void;
   children: React.ReactNode;
 }> = ({ active, primary, danger, disabled, title, onClick, children }) => {
-  let cls = 'text-fg hover:bg-subtle';
-  if (active) cls = 'bg-accent-soft text-accent hover:bg-accent-soft';
-  else if (primary) cls = 'text-long hover:bg-long-soft';
-  else if (danger) cls = 'text-danger hover:bg-danger-soft';
+  let cls = 'tb-btn--default';
+  if (active) cls = 'tb-btn--active';
+  else if (primary) cls = 'tb-btn--primary';
+  else if (danger) cls = 'tb-btn--danger';
   return (
     <button
       type="button"
       title={title}
       disabled={disabled}
       onClick={onClick}
-      className={`w-8 h-8 rounded-md flex items-center justify-center transition-colors ${
-        disabled ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'
-      } ${cls}`}
+      className={`tb-btn ${disabled ? 'tb-btn--disabled' : ''} ${cls}`}
     >
       {children}
     </button>
@@ -644,7 +642,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
 
   return (
     <div
-      className="fixed inset-0 z-[100] select-none overflow-hidden"
+      className="shot-root"
       style={{ cursor: rootCursor }}
       onMouseDown={onMouseDown}
       onMouseMove={onMouseMove}
@@ -662,13 +660,13 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       }}
     >
       {/* 标注层 */}
-      <canvas ref={annoCanvas} className="absolute left-0 top-0 pointer-events-none" style={{ width: W, height: H }} />
+      <canvas ref={annoCanvas} className="anno-canvas" style={{ width: W, height: H }} />
 
       {/* 遮罩 */}
       {!sel &&
         (detected && phase === 'pick' ? (
           <div
-            className="absolute pointer-events-none"
+            className="shot-outline"
             style={{
               left: detected.x,
               top: detected.y,
@@ -680,11 +678,11 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
             }}
           />
         ) : (
-          <div className="absolute inset-0 pointer-events-none" style={{ background: `rgba(0,0,0,${op})` }} />
+          <div className="shot-mask" style={{ background: `rgba(0,0,0,${op})` }} />
         ))}
       {sel && (
         <div
-          className="absolute pointer-events-none"
+          className="shot-outline"
           style={{
             left: sel.x,
             top: sel.y,
@@ -699,19 +697,19 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       {/* 十字准线 */}
       {settings.showCrosshair && phase === 'pick' && (
         <>
-          <div className="absolute top-0 bottom-0 w-px pointer-events-none" style={{ left: cursor.x, background: ACCENT_SOFT }} />
-          <div className="absolute left-0 right-0 h-px pointer-events-none" style={{ top: cursor.y, background: ACCENT_SOFT }} />
+          <div className="crosshair-v" style={{ left: cursor.x, background: ACCENT_SOFT }} />
+          <div className="crosshair-h" style={{ top: cursor.y, background: ACCENT_SOFT }} />
         </>
       )}
 
       {/* 自动识别标签 */}
       {!sel && detected && phase === 'pick' && (
         <div
-          className="absolute pointer-events-none h-6 px-2 rounded bg-[#1f1f1f]/90 text-white text-[12px] flex items-center gap-2 whitespace-nowrap"
+          className="detect-tag"
           style={{ left: detected.x + 6, top: detected.y + 6 }}
         >
           <span>{detected.name}</span>
-          <span className="font-mono text-white/70">
+          <span className="detect-tag-size">
             {Math.round(detected.w * dpr)} × {Math.round(detected.h * dpr)}
           </span>
         </div>
@@ -720,11 +718,11 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       {/* 选区尺寸 */}
       {sel && (
         <div
-          className="absolute pointer-events-none h-6 px-2 rounded bg-[#1f1f1f]/90 text-white text-[12px] font-mono flex items-center whitespace-nowrap"
+          className="size-tag"
           style={{ left: sel.x, top: sel.y >= 32 ? sel.y - 30 : sel.y + 6 }}
         >
           {Math.round(sel.w * dpr)} × {Math.round(sel.h * dpr)}
-          {phase === 'long' && <span className="ml-2 font-sans text-[#8fb4ff]">长截图中 · 滚动滚轮拼接 · Enter 完成 · Esc 取消</span>}
+          {phase === 'long' && <span className="size-tag-hint">长截图中 · 滚动滚轮拼接 · Enter 完成 · Esc 取消</span>}
         </div>
       )}
 
@@ -739,7 +737,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
             <div
               key={h}
               data-handle={h}
-              className="absolute w-2.5 h-2.5 bg-white rounded-[2px] shadow"
+              className="sel-handle"
               style={{ left: hx - 5, top: hy - 5, border: `1.5px solid ${ACCENT}`, cursor: HANDLE_CURSOR[h] }}
             />
           );
@@ -750,7 +748,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
         <>
           <div
             ref={tbRef}
-            className="absolute h-10 px-1.5 bg-card rounded-lg border border-stroke shadow-flyout animate-pop-in flex items-center gap-0.5"
+            className="shot-toolbar"
             style={{ left: tbLeft, top: tbTop, cursor: 'default' }}
             onMouseDown={(e) => e.stopPropagation()}
             onDoubleClick={(e) => e.stopPropagation()}
@@ -765,7 +763,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
               title="序号"
               onClick={() => setTool(tool === 'number' ? null : 'number')}
             >
-              <span className="w-[17px] h-[17px] rounded-full border-[1.8px] border-current text-[10px] font-bold flex items-center justify-center leading-none">
+              <span className="tool-index">
                 {annos.filter((a) => a.tool === 'number').length + 1}
               </span>
             </TbBtn>
@@ -801,7 +799,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
           {/* 二级工具栏：粗细 / 颜色 */}
           {tool && (
             <div
-              className="absolute h-9 px-2.5 bg-card rounded-lg border border-stroke shadow-flyout animate-pop-in flex items-center gap-2"
+              className="shot-subbar"
               style={{ left: tbLeft, top: subTop, cursor: 'default' }}
               onMouseDown={(e) => e.stopPropagation()}
               onDoubleClick={(e) => e.stopPropagation()}
@@ -811,10 +809,10 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
                   key={s}
                   type="button"
                   onClick={() => setSize(s)}
-                  className={`w-7 h-7 rounded-md flex items-center justify-center cursor-pointer ${size === s ? 'bg-accent-soft' : 'hover:bg-subtle'}`}
+                  className={`swatch-btn ${size === s ? 'swatch-btn--on' : 'swatch-btn--off'}`}
                   title={['细', '中', '粗'][s - 1]}
                 >
-                  <span className="rounded-full bg-fg" style={{ width: 4 + s * 3, height: 4 + s * 3 }} />
+                  <span className="swatch-dot" style={{ width: 4 + s * 3, height: 4 + s * 3 }} />
                 </button>
               ))}
               {tool !== 'mosaic' && (
@@ -825,7 +823,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
                       key={c}
                       type="button"
                       onClick={() => setColor(c)}
-                      className="w-5 h-5 rounded-full cursor-pointer border border-stroke-strong transition-transform"
+                      className="color-swatch"
                       style={{
                         background: c,
                         boxShadow: color === c ? `0 0 0 2px var(--card), 0 0 0 3.5px ${ACCENT}` : undefined,
@@ -854,7 +852,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
             }
           }}
           placeholder="输入文字，Enter 确认"
-          className="absolute bg-transparent outline-none resize-none border border-dashed rounded px-1 py-0.5 font-semibold leading-[1.3] min-w-[160px]"
+          className="anno-input"
           style={{
             left: textEdit.x - 5,
             top: textEdit.y - 3,
@@ -871,19 +869,19 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       {/* 放大镜 */}
       {showMag && pixel && (
         <div
-          className="absolute pointer-events-none rounded-md overflow-hidden bg-[#1f1f1f] border border-white/20 shadow-[0_6px_20px_rgba(0,0,0,0.45)]"
+          className="magnifier"
           style={{ left: magLeft, top: magTop, width: MAG_W }}
         >
-          <canvas ref={magCanvas} className="block" style={{ width: MAG_W, height: MAG_W }} />
-          <div className="px-2 py-1.5 text-[11px] leading-[16px] text-white/90 font-mono">
+          <canvas ref={magCanvas} className="u-block" style={{ width: MAG_W, height: MAG_W }} />
+          <div className="mag-info">
             <div>
               POS ({Math.round(cursor.x * dpr)}, {Math.round(cursor.y * dpr)})
             </div>
-            <div className="flex items-center gap-1.5">
-              <span className="inline-block w-3 h-3 rounded-sm border border-white/30" style={{ background: toHex(pixel) }} />
+            <div className="mag-row">
+              <span className="mag-chip" style={{ background: toHex(pixel) }} />
               <span>{toHex(pixel)}</span>
             </div>
-            <div className="text-white/50">
+            <div className="mag-dim">
               RGB({pixel[0]},{pixel[1]},{pixel[2]}) · 按 C 复制
             </div>
           </div>
@@ -893,55 +891,53 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
       {/* 长截图面板 */}
       {sel && phase === 'long' && (
         <div
-          className="absolute bg-card rounded-lg border border-stroke shadow-dialog animate-panel-in flex flex-col overflow-hidden"
+          className="long-panel"
           style={{ left: panelLeft, top: panelTop, width: PANEL_W, cursor: 'default' }}
           onMouseDown={(e) => e.stopPropagation()}
           onWheel={(e) => e.stopPropagation()}
         >
-          <div className="h-10 px-3 flex items-center justify-between border-b border-stroke">
-            <div className="flex items-center gap-1.5 text-[13px] font-semibold text-fg">
-              <ScrollText size={15} className="text-accent" />
+          <div className="long-head">
+            <div className="long-title">
+              <ScrollText size={15} className="u-accent" />
               长截图
             </div>
-            <span className="text-[11px] text-fg2 bg-layer rounded px-1.5 py-0.5">{long.frames} 帧</span>
+            <span className="long-badge">{long.frames} 帧</span>
           </div>
-          <div ref={previewBox} className="bg-app win-scroll p-4 max-h-[44vh] overflow-y-auto">
-            <canvas ref={previewCanvas} className="block mx-auto bg-card shadow border border-stroke" />
+          <div ref={previewBox} className="long-preview win-scroll">
+            <canvas ref={previewCanvas} className="long-canvas" />
           </div>
-          <div className="px-3 py-2 border-t border-stroke">
-            <div className="text-[12px] font-mono text-fg">
+          <div className="long-foot">
+            <div className="long-size">
               {long.w} × {long.h} px
             </div>
             <div
-              className={`text-[12px] mt-0.5 ${
+              className={`long-status ${
                 long.status === 'seam' || long.status === 'noscroll'
-                  ? 'text-danger'
+                  ? 'long-status--danger'
                   : long.status === 'bottom' || long.status === 'nochange' || long.status === 'full'
-                    ? 'text-long'
-                    : 'text-fg2'
+                    ? 'long-status--ok'
+                    : 'long-status--muted'
               }`}
             >
               {long.auto ? '自动滚动中… ' : ''}
               {longStatusText[long.status]}
             </div>
           </div>
-          <div className="px-3 pb-3 flex items-center gap-2">
+          <div className="long-actions">
             <button
               type="button"
               onClick={() => setLong((l) => ({ ...l, auto: !l.auto }))}
-              className={`h-8 px-2.5 rounded-md border text-[12px] flex items-center gap-1 cursor-pointer transition-colors ${
-                long.auto ? 'bg-accent-soft border-accent text-accent' : 'border-stroke-strong text-fg hover:bg-card-hover'
-              }`}
+              className={`auto-btn ${long.auto ? 'auto-btn--on' : 'auto-btn--off'}`}
             >
               {long.auto ? <Pause size={13} /> : <Play size={13} />}
               {long.auto ? '暂停' : '自动滚动'}
             </button>
-            <div className="flex-1" />
+            <div className="u-flex-1" />
             <button
               type="button"
               onClick={cancelLong}
               title="取消 (Esc)"
-              className="h-8 w-8 rounded-md text-danger hover:bg-danger-soft flex items-center justify-center cursor-pointer"
+              className="panel-btn panel-btn--icon"
             >
               <X size={16} />
             </button>
@@ -949,7 +945,7 @@ export function ScreenshotOverlay({ desktop, mode, settings, allowLong, onClose,
               type="button"
               onClick={finishLong}
               title="完成 (Enter)"
-              className="h-8 px-3 rounded-md bg-accent hover:bg-accent-hover text-on-accent text-[12px] flex items-center gap-1 cursor-pointer"
+              className="panel-btn panel-btn--primary"
             >
               <Check size={14} /> 完成
             </button>

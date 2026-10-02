@@ -484,7 +484,7 @@ export function App() {
     // 根节点必须自带不透明底色：窗口已是 transparent:false + 无 WS_EX_LAYERED，
     // 而 body 恒为 transparent（overlay 窗口需要），这里不铺满就会露黑。
     return (
-      <div className="fixed inset-0 overflow-hidden select-none bg-app">
+      <div className="panel-root">
         {showMain && (
           <MainWindow
             settings={settings}
@@ -502,60 +502,52 @@ export function App() {
   /* ================= 覆盖层窗口：抓屏画布 / 覆盖层 / 贴图 / 托盘菜单 / 提示条 ================= */
   return (
     <div
-      className="fixed inset-0 overflow-hidden select-none"
+      className="overlay-root"
       onMouseDown={() => setTrayMenu(false)}
     >
       {/* 桌面 / 真实屏幕抓帧画布（原生空闲态隐藏，让窗口对鼠标完全穿透） */}
-      <canvas ref={canvasRef} className="absolute left-0 top-0 block" style={{ display: overlay ? 'block' : 'none' }} />
+      <canvas ref={canvasRef} className="capture-canvas" style={{ display: overlay ? 'block' : 'none' }} />
 
       {/* 托盘菜单（原生由真实托盘图标事件唤起）—— `preparing` 期间同样不渲染 */}
       {desktop && trayMenu && !overlay && !preparing && (
         <div
-          className="absolute z-50 w-[200px] bg-acrylic backdrop-blur rounded-lg border border-stroke shadow-flyout animate-menu-in py-1.5 text-[13px] text-fg"
+          className="tray-menu"
           data-region="tray"
           style={{ right: 16, bottom: 64 }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="px-3 py-1.5 flex items-center gap-2 text-[12px] text-fg2">
+          <div className="tray-head">
             <AppLogo size={16} /> {APP_NAME} {APP_VERSION}
           </div>
-          <div className="h-px bg-stroke my-1" />
+          <div className="tray-sep" />
           {[
             { icon: <Crop size={15} />, label: '截图', kbd: settings.hotkeys.shot, onClick: () => startOverlay('shot') },
             { icon: <ScrollText size={15} />, label: '长截图', kbd: settings.hotkeys.long, onClick: () => startOverlay('long') },
             { icon: <Pin size={15} />, label: '贴图', kbd: settings.hotkeys.pin, onClick: pinLast },
           ].map((m) => (
-            <button key={m.label} type="button" onClick={m.onClick} className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer">
-              <span className="text-accent">{m.icon}</span>
-              <span className="flex-1 text-left">{m.label}</span>
-              <span className="text-[11px] text-fg3">{m.kbd}</span>
+            <button key={m.label} type="button" onClick={m.onClick} className="tray-item">
+              <span className="tray-icon">{m.icon}</span>
+              <span className="tray-label">{m.label}</span>
+              <span className="tray-kbd">{m.kbd}</span>
             </button>
           ))}
-          <div className="h-px bg-stroke my-1" />
-          <button
-            type="button"
-            onClick={openPanel}
-            className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
-          >
-            <Settings2 size={15} className="text-fg2" /> 配置…
+          <div className="tray-sep" />
+          <button type="button" onClick={openPanel} className="tray-item">
+            <Settings2 size={15} className="u-fg2" /> 配置…
           </button>
-          <button
-            type="button"
-            onClick={openPanel}
-            className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
-          >
-            <Info size={15} className="text-fg2" /> 关于
+          <button type="button" onClick={openPanel} className="tray-item">
+            <Info size={15} className="u-fg2" /> 关于
           </button>
-          <div className="h-px bg-stroke my-1" />
+          <div className="tray-sep" />
           <button
             type="button"
             onClick={() => {
               setTrayMenu(false);
               showToast(`请右键托盘图标退出${APP_NAME}`);
             }}
-            className="w-full h-8 px-3 flex items-center gap-2.5 hover:bg-subtle cursor-pointer"
+            className="tray-item"
           >
-            <Power size={15} className="text-fg2" /> 退出
+            <Power size={15} className="u-fg2" /> 退出
           </button>
         </div>
       )}
@@ -584,7 +576,7 @@ export function App() {
 
       {/* 提示 —— 同上，`preparing` 期间不渲染（否则提示条会破坏整窗透明） */}
       {toast && !preparing && (
-        <div className="fixed left-1/2 -translate-x-1/2 z-[200] bg-[#1f1f1f]/92 text-white border border-white/15 text-[12.5px] px-4 h-9 rounded-md shadow-dialog animate-toast-in flex items-center gap-2 pointer-events-none" style={{ bottom: 72 }}>
+        <div className="toast" style={{ bottom: 72 }}>
           <AppLogo size={14} />
           {toast}
         </div>

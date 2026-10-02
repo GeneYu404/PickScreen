@@ -70,7 +70,7 @@ export const ResultWindow: React.FC<Props> = ({ item, dpr, onClose, onToast }) =
 
   return (
     <div
-      className="absolute z-30 bg-card shadow-pin select-none"
+      className="pin-window"
       data-region="pin"
       style={{ left: pos.x, top: pos.y, width: displayW, outline: `1px solid ${hover ? 'var(--accent)' : 'var(--stroke-strong)'}` }}
       onMouseEnter={() => setHover(true)}
@@ -85,27 +85,25 @@ export const ResultWindow: React.FC<Props> = ({ item, dpr, onClose, onToast }) =
       }}
       title="拖动移动 · 滚轮缩放 · 悬停后点 ✕ 关闭"
     >
-      <div className="overflow-y-auto overflow-x-hidden" style={{ maxHeight: maxH, cursor: 'move' }}>
-        <img src={item.dataUrl} alt="" draggable={false} className="block" style={{ width: displayW }} />
+      <div className="pin-scroll" style={{ maxHeight: maxH, cursor: 'move' }}>
+        <img src={item.dataUrl} alt="" draggable={false} className="u-block" style={{ width: displayW }} />
       </div>
 
       {/* 悬停操作栏 */}
       <div
-        className={`absolute top-2 right-2 flex items-center gap-0.5 bg-acrylic backdrop-blur rounded-md border border-stroke shadow-flyout p-0.5 transition-opacity ${
-          hover ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
+        className={`pin-bar ${hover ? 'pin-bar--on' : 'pin-bar--off'}`}
         onMouseDown={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
       >
-        <span className="px-1.5 text-[11px] text-fg2 font-mono flex items-center gap-1" title={`${item.w} × ${item.h} px`}>
-          <Pin size={11} className="text-accent" />
+        <span className="pin-zoom" title={`${item.w} × ${item.h} px`}>
+          <Pin size={11} className="u-accent" />
           {Math.round(zoom * 100)}%
         </span>
         <button
           type="button"
           title="复制"
           onClick={async () => onToast((await copyDataUrl(item.dataUrl)) ? '已复制到剪贴板' : '复制失败：浏览器未授权剪贴板')}
-          className="w-7 h-7 rounded flex items-center justify-center text-fg hover:bg-subtle cursor-pointer"
+          className="pin-btn"
         >
           <Copy size={14} />
         </button>
@@ -116,7 +114,7 @@ export const ResultWindow: React.FC<Props> = ({ item, dpr, onClose, onToast }) =
             const path = await downloadDataUrl(item.dataUrl, item.kind === 'long' ? `${FILE_PREFIX}_长截图` : FILE_PREFIX);
             onToast(path ? `已保存到 ${path}` : '已保存');
           }}
-          className="w-7 h-7 rounded flex items-center justify-center text-fg hover:bg-subtle cursor-pointer"
+          className="pin-btn"
         >
           <Download size={14} />
         </button>
@@ -124,7 +122,7 @@ export const ResultWindow: React.FC<Props> = ({ item, dpr, onClose, onToast }) =
           type="button"
           title="关闭"
           onClick={() => onClose(item.id)}
-          className="w-7 h-7 rounded flex items-center justify-center text-danger hover:bg-danger-soft cursor-pointer"
+          className="pin-btn pin-btn--danger"
         >
           <X size={15} />
         </button>
