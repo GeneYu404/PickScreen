@@ -18,6 +18,11 @@
 - 锁文件是 `bun.lock`，**不要**生成 / 提交 `package-lock.json`
 - 不要主动 `npm install`；Node 24 只在 CI 缺 Bun 时允许降级
 
+**前端栈（2026-10-03 起）**：React 19 源码跑在 **Preact 兼容层**上（`vite.config.ts` 的
+`resolve.alias`；`react-dom` / `react/jsx-runtime` 必须排在 `react` **前面**，否则前缀匹配会
+生成不存在的 `preact/compat/jsx-runtime`）。样式是**手写原生 CSS**，`tailwindcss` /
+`@tailwindcss/vite` / `tailwind-merge` 已移除，`cn()` 只剩 `clsx`。两个硬约束见 §6。
+
 ## 2. 构建
 
 **只出 exe，不打 NSIS 安装包**（用户明确要求）。用：
