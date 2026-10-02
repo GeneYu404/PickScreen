@@ -238,6 +238,18 @@ fn main() {
 
     tauri::Builder::default()
         .manage(SharedState::new())
+        // 单例：必须注册在所有其它插件之前。
+        // 本应用的主窗口是铺满虚拟桌面的透明穿透窗，第二个实例会叠一层上去、
+        // 并且抢不到全局热键（hotkey.rs 里注册失败是静默忽略的），用户却毫无提示。
+        // 这里把第二次启动转成「唤起已有实例的配置面板」，与托盘菜单的 show 同一通道。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Emitter;
+            // 必须走 set_window_visible(true) 而不是裸 win.show()：
+            // 它会先把 NOACTIVATE 钉好再 show，裸 show 会被 tao 的 SW_SHOW 顺手激活，
+            // 抢到前台后用户的按键会落进透明窗口。
+            set_window_visible(app.clone(), true);
+            let _ = app.emit("action", "show");
+        }))
         // 官方插件（前端 JS 也使用 store / dialog）
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
