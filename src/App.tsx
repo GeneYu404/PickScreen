@@ -15,6 +15,15 @@ import { currentWindowLabel, isTauriEnv, NativeBridge } from './bridge/tauri';
 
 const uid = () => Math.random().toString(36).slice(2, 7);
 
+/**
+ * 等两帧再放行。
+ *
+ * 第一帧回调时 DOM/canvas 已提交，但浏览器往往还没把它合成上屏；第二帧回调时屏幕
+ * 像素才是最新的。用于「窗口显示前先让画面就绪」，避免全屏 overlay 先闪一个空层。
+ */
+const nextPaint = () =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
 /** 是否运行在 Tauri v2 + WebView2 原生容器中（模块级常量，双环境编译） */
 const native = isTauriEnv();
 
@@ -42,6 +51,15 @@ export function App() {
   const [showMain, setShowMain] = useState(!native);
   const [trayMenu, setTrayMenu] = useState(false);
   const [overlay, setOverlay] = useState<{ mode: 'shot' | 'long' } | null>(null);
+  /** 覆盖层窗口的**抓屏画面是否已就绪**。false 时窗口保持隐藏，避免先闪一个空的全屏层。 */
+  const [frameReady, setFrameReady] = useState(false);
+  /**
+   * 抓屏准备期：窗口已显示但**内容为空**（无 canvas 图像、无覆盖层 DOM）。
+   *
+   * 靠的就是「全透明 layered 窗口不参与桌面合成」——它待在屏幕上，`BitBlt` 抓到的
+   * 仍是它后面的桌面。这样窗口全程可见，不必「先藏后显」，也就没有那一下闪烁。
+   */
+  const [preparing, setPreparing] = useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef(0);
@@ -198,26 +216,48 @@ export function App() {
         return;
       }
       setTrayMenu(false);
-      setOverlay({ mode });
-      if (!native) return;
+      setFrameReady(false);
+      if (!native) {
+        setOverlay({ mode });
+        setFrameReady(true);
+        return;
+      }
+      // **先清空**。这一步必须在窗口显示之前完成：只要残留了上一帧图像或挂着的
+      // 覆盖层 DOM（45% 黑遮罩），BitBlt 就会把它们一起拍进去。
+      setOverlay(null);
+      desktop?.setScreenImage(null);
+      desktop?.setEraseRect(null);
+      if (desktop) desktop.setWindows([]);
+      // 置位 `preparing`：让 hasContent 为真，窗口先在**空内容**状态下显示出来。
+      setPreparing(true);
       void (async () => {
         try {
-          // 「截取拾屏自身」时面板必须在场才能被拍进去。托盘常驻下它通常隐藏着
-          // （从托盘/热键触发更是必然没开），此时必须先让**面板窗口**把自己显示出来
-          // ——Rust 不能代劳：它只会 show HWND，面板窗口的 React 还停在 showMain=false，
-          // 那样显示出来是一片空白。广播 'show' 走面板窗口自己的路径，由它渲染。
-          if (settings.captureSelf && !showMainRef.current) {
-            void emit('action', 'show');
-          }
+          // **不主动弹出面板。**
+          //
+          // 「允许截取拾屏自身」指的是「若面板此刻开着，就把它一起拍进去」，
+          // 而**不是**「为了拍它而先把面板叫出来」。托盘常驻下面板常态是隐藏的，
+          // 若在这里广播 'show' 强行弹出，用户在后台按一次热键就被面板糊一脸 ——
+          // 大多数时候他根本不想要这个。需要截自身时，自己先把面板打开再截图。
+          //
+          // 抓屏前再等一帧：等覆盖层窗口真正上屏、且 WebView2 提交完那帧空白，
+          // 此刻它才是「全透明且稳定」的，BitBlt 才能可靠穿透过去。
+          await nextPaint();
           const bmp = await NativeBridge.grabScreen(settings.captureSelf);
-          if (!desktop) return;
-          desktop.setEraseRect(null);
-          desktop.setWindows(
-            (await NativeBridge.listWindows()).map<DetectRegion>((w) => ({ x: w.x, y: w.y, w: w.w, h: w.h, name: w.title }))
-          );
-          desktop.setScreenImage(bmp);
+          if (desktop) {
+            desktop.setWindows(
+              (await NativeBridge.listWindows()).map<DetectRegion>((w) => ({ x: w.x, y: w.y, w: w.w, h: w.h, name: w.title }))
+            );
+          }
+          setOverlay({ mode });
+          desktop?.setScreenImage(bmp);
+          // 画面已提交上屏，再让用户看见（窗口全程可见，视觉上是连续过渡）。
+          await nextPaint();
+          setPreparing(false);
+          setFrameReady(true);
         } catch (err) {
+          setPreparing(false);
           setOverlay(null);
+          setFrameReady(true);
           showToast(`抓取屏幕失败：${String(err)}`);
           // 失败路径同样要让面板收起来，否则它会停在「grab_screen 已藏窗、
           // 但 showMain 还是 true」的不一致状态里，之后托盘唤不回来。
@@ -404,8 +444,14 @@ export function App() {
      贴图 / 提示条 / 托盘菜单」。全都为空时把 HWND 藏掉，托盘常驻期间不占顶层窗口位，
      Rust 侧 60Hz 穿透轮询也会因窗口不可见而自动休眠。
      贴图与提示条必须计入覆盖层：截图结束（Esc / 完成）后不再回主面板，
-     窗口只靠提示条再亮 2.6s，让「已复制到剪贴板 · 1024×768」这类回执仍然可见。 */
-  const hasContent = isPanel ? showMain : !!overlay || results.length > 0 || !!toast || trayMenu;
+     窗口只靠提示条再亮 2.6s，让「已复制到剪贴板 · 1024×768」这类回执仍然可见。
+
+     覆盖层那一项额外计入 `preparing`：抓屏准备期窗口**必须已经可见且是全透明的**，
+     靠「分层透明窗口不参与合成」让 `BitBlt` 穿透它。若此时把窗口藏起来、抓完再显示，
+     就会多出一次「整块全屏层的显隐」——那正是闪烁的来源。 */
+  const hasContent = isPanel
+    ? showMain
+    : preparing || (!!overlay && frameReady) || results.length > 0 || !!toast || trayMenu;
   useEffect(() => {
     if (!native) return;
     void NativeBridge.setWindowVisible(hasContent);
@@ -462,8 +508,8 @@ export function App() {
       {/* 桌面 / 真实屏幕抓帧画布（原生空闲态隐藏，让窗口对鼠标完全穿透） */}
       <canvas ref={canvasRef} className="absolute left-0 top-0 block" style={{ display: overlay ? 'block' : 'none' }} />
 
-      {/* 托盘菜单（原生由真实托盘图标事件唤起） */}
-      {desktop && trayMenu && !overlay && (
+      {/* 托盘菜单（原生由真实托盘图标事件唤起）—— `preparing` 期间同样不渲染 */}
+      {desktop && trayMenu && !overlay && !preparing && (
         <div
           className="absolute z-50 w-[200px] bg-acrylic backdrop-blur rounded-lg border border-stroke shadow-flyout animate-menu-in py-1.5 text-[13px] text-fg"
           data-region="tray"
@@ -514,8 +560,11 @@ export function App() {
         </div>
       )}
 
-      {/* 贴图 / 结果窗口 */}
-      {desktop &&
+      {/* 贴图 / 结果窗口 —— `preparing` 期间**必须不渲染**。
+          抓屏穿透的前提是整窗 alpha=0：只要有任何一处画了东西（贴图、提示条、菜单），
+          `BitBlt` 就会把它一起拍进来，或让「全透明」这个前提不成立。
+          状态不清除，抓完自然恢复。 */}
+      {desktop && !preparing &&
         results.map((r) => (
           <ResultWindow key={r.id} item={r} dpr={desktop.dpr} onClose={(id) => setResults((prev) => prev.filter((x) => x.id !== id))} onToast={showToast} />
         ))}
@@ -533,8 +582,8 @@ export function App() {
         />
       )}
 
-      {/* 提示 */}
-      {toast && (
+      {/* 提示 —— 同上，`preparing` 期间不渲染（否则提示条会破坏整窗透明） */}
+      {toast && !preparing && (
         <div className="fixed left-1/2 -translate-x-1/2 z-[200] bg-[#1f1f1f]/92 text-white border border-white/15 text-[12.5px] px-4 h-9 rounded-md shadow-dialog animate-toast-in flex items-center gap-2 pointer-events-none" style={{ bottom: 72 }}>
           <AppLogo size={14} />
           {toast}

@@ -51,15 +51,6 @@ fn panel_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> 
         .ok_or_else(|| "配置面板窗口不存在".to_string())
 }
 
-/// 覆盖层窗口：铺满整块虚拟桌面的透明穿透窗，承载截图覆盖层 / 贴图 / 提示条 / 托盘菜单。
-///
-/// 与面板拆成两个窗口，是为了让面板回归「普通窗口」的形态：抓屏时只需藏起一块
-/// 820×560 的小面板，而不是整个铺满虚拟桌面的透明层。
-fn overlay_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
-    app.get_webview_window("overlay")
-        .ok_or_else(|| "覆盖层窗口不存在".to_string())
-}
-
 fn hwnd_of(win: &tauri::WebviewWindow) -> Result<HWND, String> {
     let raw = win.hwnd().map_err(|e| e.to_string())?;
     Ok(HWND(raw.0))
@@ -99,18 +90,23 @@ async fn grab_screen(
     capture_self: bool,
 ) -> Result<tauri::ipc::Response, String> {
     let panel = panel_window(&app)?;
-    let overlay = overlay_window(&app)?;
     let panel_hwnd = hwnd_of(&panel)?;
-    let overlay_hwnd = hwnd_of(&overlay)?;
     let st = app.state::<SharedState>();
     // 抓屏期间把「面板是否在场」告诉等待循环：Rust 不自己 show 面板（那只会得到
     // 一片空白），而是等前端 setShowMain(true) → set_window_visible 走完。
     let panel_visible = Arc::new(AtomicBool::new(panel.is_visible().unwrap_or(false)));
 
-    // 不依赖前端 hasContent 的时序：React 状态更新与 invoke 并发，抓屏可能跑在覆盖层
-    // show 之前，也可能跑在之后。这里直接钉住「抓屏时覆盖层不可见」。
-    let _ = overlay.hide();
-    winapi::set_shown(overlay_hwnd, false);
+    // **不再 hide 覆盖层。**
+    //
+    // 靠「全透明 layered 窗口不参与桌面合成」让 BitBlt 穿透它：前端先把覆盖层窗口
+    // 以**空内容**显示出来（`preparing`），等 WebView2 提交完那帧空白后调本命令，
+    // 此刻它是一块 alpha=0 的分层窗口，抓到的直接是它后面的桌面。窗口全程可见，
+    // 也就没有「整块全屏层先藏后显」的那一下闪烁。
+    //
+    // `self_capture` 在抓帧期间冻结轮询的样式计算：否则 60Hz 线程可能把窗口切成
+    // 不透明，就等于拿自己的窗口盖住待截的桌面。
+    let st_self = st.self_capture.clone();
+    st_self.store(true, Ordering::Relaxed);
 
     let bytes = if capture_self {
         st.overlay.store(true, Ordering::Relaxed);
@@ -127,39 +123,33 @@ async fn grab_screen(
         //
         // State<'_, T> 借用了 app，不能进 spawn_blocking 的 'static 闭包；
         // 把真正拥有所有权的 Arc 克隆出来。
+        // 「允许截取拾屏自身」= **面板此刻开着就一起拍进去**，而不是「为了拍它而先把
+        // 面板叫出来」。前端不再主动弹面板（托盘常驻下大多数时候用户并不想要那个），
+        // 所以这里也不该为等它出现而阻塞：面板可见就等它稳定，不可见就直接抓。
+        //
+        // State<'_, T> 借用了 app，不能进 spawn_blocking 的 'static 闭包；
+        // 把真正拥有所有权的 Arc 克隆出来。
         let painted_slot = st.panel_painted.clone();
         let r = tauri::async_runtime::spawn_blocking(move || {
-            // 先等面板真的可见（前端收到 'shot' 后会 setShowMain(true) → 触发
-            // set_window_visible）。这一段覆盖「从托盘触发、面板原本隐藏」的主场景。
-            const VISIBLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1200);
-            let t0 = std::time::Instant::now();
-            while !panel_visible.load(Ordering::Relaxed) {
-                if t0.elapsed() >= VISIBLE_DEADLINE {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(16));
-            }
-
-            // `DwmFlush` 只等 DWM 的合成队列，**等不到** WebView2 提交自己的
-            // DirectComposition 表面 —— 那是另一次异步提交。面板刚 show 时队列里可能
-            // 还没有对应命令，立刻抓会拿到「还没画好」的中间态。
-            //
-            // 双重保险：先等前端上报首帧（覆盖 WebView2 冷启动），再多留一点让 DWM
-            // 真的把它合成上屏；没上报就等到上限，不让抓屏无限阻塞。
+            // 面板**已经在屏上**时才等它把首帧交完，否则立刻抓到「还没画好」的中间态
+            // （用户描述的自身截图发虚）。`DwmFlush` 只等 DWM 的合成队列，等不到
+            // WebView2 提交自己的 DirectComposition 表面 —— 那是另一次异步提交。
             const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
             const DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
-            let started = std::time::Instant::now();
-            loop {
-                let painted = painted_slot
-                    .lock()
-                    .ok()
-                    .and_then(|s| *s)
-                    .map(|t| t.elapsed() >= SETTLE)
-                    .unwrap_or(false);
-                if painted || started.elapsed() >= DEADLINE {
-                    break;
+            if panel_visible.load(Ordering::Relaxed) {
+                let started = std::time::Instant::now();
+                loop {
+                    let painted = painted_slot
+                        .lock()
+                        .ok()
+                        .and_then(|s| *s)
+                        .map(|t| t.elapsed() >= SETTLE)
+                        .unwrap_or(false);
+                    if painted || started.elapsed() >= DEADLINE {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(16));
             }
             winapi::flush_composition();
             capture::grab_virtual()
@@ -191,15 +181,29 @@ async fn grab_screen(
         r
     };
 
-    // 抓完之后把覆盖层窗口放回来。必须在这里做，不能指望前端：
-    // 前端 `setOverlay` 触发的 set_window_visible 与本命令的 invoke 是并发的，
-    // 两种到达次序都成立 ——
-    //   show 先到 → 本命令藏起来抓屏，抓完没人再 show（hasContent 没变化，不重跑）→ 卡在隐藏
-    //   本命令先到 → 藏（本来就是隐藏的）→ 抓 → 前端 show 正常
-    // 第一种次序下只有这里能救回来，而它同时也是语义上正确的一步：抓完屏就该显示覆盖层。
-    set_window_visible(app.clone(), "overlay".to_string(), true);
-
+    // 解冻穿透控制。显示时机完全由前端 `hasContent` 独占（`preparing` / `frameReady`
+    // 翻转会各自驱动一次 `set_window_visible`），本命令不抢。
+    st_self.store(false, Ordering::Relaxed);
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 屏幕几何诊断：把「画布像素尺寸 ↔ 抓屏帧尺寸 ↔ 屏幕布局」一次性摆出来。
+///
+/// 覆盖层把抓到的整屏帧画到 canvas 上，画面是否变形 / 跳变，取决于
+/// **canvas 的 backing store 像素尺寸**与**帧的物理像素尺寸**是否一致。
+/// 两者只要不等，`drawImage` 就会拉伸 —— 窗口尺寸一变就重新算，视觉上就是
+/// 「画面突然缩放了一下」。这个命令把三方的真值都读出来，一眼可判。
+#[tauri::command]
+fn screen_geometry() -> String {
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    let (x, y, w, h) = capture::virtual_desktop_bounds();
+    let dpi = unsafe { GetDpiForSystem() }.max(96) as f64 / 96.0;
+    format!(
+        "虚拟桌面物理=({x},{y}) {w}x{h} | 系统DPI={dpi:.2} | 若窗口CSS尺寸={}x{}",
+        w as f64 / dpi,
+        h as f64 / dpi
+    )
 }
 
 /// 窗口样式诊断：把 `GWL_EXSTYLE` 的关键位回报给前端显示。
@@ -283,15 +287,31 @@ fn end_overlay(app: tauri::AppHandle) {
 #[tauri::command]
 fn set_window_visible(app: tauri::AppHandle, label: String, visible: bool) {
     let Some(win) = app.get_webview_window(&label) else { return };
+    let in_overlay = app.state::<SharedState>().overlay.load(Ordering::Relaxed);
     let res = if visible {
+        // **样式必须在 show 之前就是对的。**
+        //
+        // tao 的 `show()` 内部是 `dispatcher.send_message(...)`（PostMessage），它真正
+        // 执行 `set_visible` 时会重置 exstyle —— 所以「show 之后再补写」是**无效**的
+        // （补写会落在 tao 前面，照样被覆盖）。以前这里还额外挂了个 20ms 延迟补钉，
+        // 那是在治「先坏后修」的标，掩盖不了首次 show 那一帧。
+        //
+        // 真正的保证在 `start_passthrough_thread`：**隐藏期也以 1Hz 钉住样式**，所以
+        // 首次 show 之前 overlay 已经是「穿透 + NOACTIVATE」的身份，不会整块盖住屏幕。
+        // 这里 show 之前再按当前模式写一次，覆盖「刚切换模式就立刻 show」的情况。
         if let Ok(h) = hwnd_of(&win) {
             if label == "main" {
                 // 面板是普通窗口：整块可命中、点它该获得焦点去录快捷键。
                 winapi::harden_panel(h);
             } else {
-                // 覆盖层铺满整块虚拟桌面：先钉穿透 + NOACTIVATE，抢到前台后用户的
-                // 按键不会落进透明窗口（例如截图后的「已复制」提示停留的 2.6s）。
-                winapi::set_interactive(h, false);
+                if in_overlay {
+                    // 覆盖层已进入框选态：可命中、可聚焦
+                    winapi::set_interactive(h, true);
+                } else {
+                    // 空闲态：穿透 + NOACTIVATE，抢到前台后用户的按键不会落进透明窗口
+                    // （例如截图后的「已复制」提示停留的 2.6s）。
+                    winapi::set_interactive(h, false);
+                }
             }
         }
         win.show()
@@ -470,6 +490,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             grab_screen,
             list_windows,
+            screen_geometry,
             window_diagnostics,
             mark_panel_painted,
             sync_pin_regions,

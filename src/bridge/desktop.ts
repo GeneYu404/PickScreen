@@ -25,7 +25,9 @@ export interface DetectRegion extends Rect {
 export class ScreenFrame {
   readonly canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  dpr = 1;
+  /** CSS px → canvas 像素 的**真实**换算比。有帧时 = 帧物理尺寸 ÷ 视口 CSS 尺寸。 */
+  private pxScaleX = 1;
+  private pxScaleY = 1;
   width = 1;
   height = 1;
   /** Rust 抓取的整屏帧；null = 空闲态（画布透明，让真实桌面透出来） */
@@ -36,6 +38,27 @@ export class ScreenFrame {
   private eraseRect: Rect | null = null;
   private raf = 0;
 
+  /**
+   * CSS px → 输出画布像素 的换算比。
+   *
+   * 名字沿用 `dpr` 以保持 API 兼容，但**语义变了**：不再是
+   * `window.devicePixelRatio`（那只是**主屏**的缩放比），而是本画布真实的
+   * 「物理像素 ÷ CSS 像素」。
+   *
+   * 为什么要换：覆盖层窗口铺满整块虚拟桌面，多屏混合缩放下它需要的有效比例是
+   * 「虚拟桌面物理宽 ÷ 虚拟桌面 CSS 宽」，与主屏的 `devicePixelRatio` **并不相等**。
+   * 用后者算画布尺寸，图像就被拉伸；窗口视口一变（show 后 WebView2 才定下视口）
+   * `resize()` 重算 → 图像按新比例重新绘制 → 用户看到「画面突然缩放了一下」。
+   * 外部 `captureRegion` / `getPixel` / 标注 `setTransform` 都用它，保持统一口径。
+   */
+  get dpr(): number {
+    return this.pxScaleX;
+  }
+  /** 纵轴换算比；与 x 不同仅在混合缩放下发生 */
+  get dprY(): number {
+    return this.pxScaleY;
+  }
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { willReadFrequently: true })!;
@@ -45,14 +68,29 @@ export class ScreenFrame {
   /* ---------------- 尺寸 ---------------- */
 
   resize() {
-    this.dpr = window.devicePixelRatio || 1;
+    // CSS 尺寸始终跟随视口（窗口铺满虚拟桌面，视口就是整块桌面）。
     this.width = Math.max(320, window.innerWidth);
     this.height = Math.max(240, window.innerHeight);
-    this.canvas.width = Math.round(this.width * this.dpr);
-    this.canvas.height = Math.round(this.height * this.dpr);
     this.canvas.style.width = `${this.width}px`;
     this.canvas.style.height = `${this.height}px`;
+    // backing store（像素尺寸）**在有帧时锁定为帧的真实物理尺寸**，不随视口重算。
+    // 这是消除「缩放跳变」的关键：视口变化只改 CSS 尺寸，由浏览器负责平滑缩放，
+    // 图像内容始终是 1:1 像素，不会被重新拉伸绘制。
+    if (this.frame) {
+      this.canvas.width = this.frame.width;
+      this.canvas.height = this.frame.height;
+    } else {
+      const d = window.devicePixelRatio || 1;
+      this.canvas.width = Math.round(this.width * d);
+      this.canvas.height = Math.round(this.height * d);
+    }
+    this.syncScale();
     this.render();
+  }
+
+  private syncScale() {
+    this.pxScaleX = this.canvas.width / this.width;
+    this.pxScaleY = this.canvas.height / this.height;
   }
 
   /* ---------------- 输入 ---------------- */
@@ -60,6 +98,12 @@ export class ScreenFrame {
   /** 送入 Rust 抓取的整屏帧；传 null 回到空闲态 */
   setScreenImage(frame: ImageBitmap | null) {
     this.frame = frame;
+    if (frame) {
+      // 帧的物理尺寸就是权威值：1:1 像素，不掺 devicePixelRatio 推算。
+      this.canvas.width = frame.width;
+      this.canvas.height = frame.height;
+      this.syncScale();
+    }
     this.render();
   }
 
@@ -100,17 +144,18 @@ export class ScreenFrame {
   /** 截取屏幕区域（CSS px），返回设备像素尺寸的画布 */
   captureRegion(r: Rect): HTMLCanvasElement {
     const out = document.createElement('canvas');
-    const sx = Math.round(r.x * this.dpr);
-    const sy = Math.round(r.y * this.dpr);
-    out.width = Math.max(1, Math.round(r.w * this.dpr));
-    out.height = Math.max(1, Math.round(r.h * this.dpr));
+    // 源与目标必须用**同一个**换算比，否则裁出来的区域会偏移/缩放。
+    const sx = Math.round(r.x * this.pxScaleX);
+    const sy = Math.round(r.y * this.pxScaleY);
+    out.width = Math.max(1, Math.round(r.w * this.pxScaleX));
+    out.height = Math.max(1, Math.round(r.h * this.pxScaleY));
     out.getContext('2d')!.drawImage(this.canvas, sx, sy, out.width, out.height, 0, 0, out.width, out.height);
     return out;
   }
 
   getPixel(x: number, y: number): [number, number, number] {
-    const px = Math.max(0, Math.min(this.canvas.width - 1, Math.round(x * this.dpr)));
-    const py = Math.max(0, Math.min(this.canvas.height - 1, Math.round(y * this.dpr)));
+    const px = Math.max(0, Math.min(this.canvas.width - 1, Math.round(x * this.pxScaleX)));
+    const py = Math.max(0, Math.min(this.canvas.height - 1, Math.round(y * this.pxScaleY)));
     const d = this.ctx.getImageData(px, py, 1, 1).data;
     return [d[0], d[1], d[2]];
   }
@@ -118,22 +163,22 @@ export class ScreenFrame {
   /* ---------------- 绘制 ---------------- */
 
   render() {
-    const { ctx, width: W, height: H, dpr } = this;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { ctx, canvas } = this;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
 
     if (!this.frame) {
       // 空闲态：整块画布保持透明，真实桌面从窗口后面透出来（鼠标穿透的前提）
-      ctx.clearRect(0, 0, W, H);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       return;
     }
 
-    const img = this.frame;
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
-    const s = Math.min(W / img.width, H / img.height);
-    const dw = img.width * s;
-    const dh = img.height * s;
-    ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    // 帧按 1:1 物理像素画进 backing store —— 不做任何缩放。
+    // 缩放交给浏览器的 CSS 尺寸去处理：视口变化时只是采样密度变化，
+    // 图像内容比例恒定，也就不会出现「缩放跳一下」。
+    ctx.drawImage(this.frame, 0, 0, canvas.width, canvas.height);
+
+    // 切回 CSS 坐标系，供遮罩 / 选框 / 擦除矩形用（它们都以 CSS px 表述）
+    ctx.setTransform(this.pxScaleX, 0, 0, this.pxScaleY, 0, 0);
 
     // 长截图：选区透出实时画面（这是「抓帧不把自己拍进去」的关键）
     if (this.eraseRect) {

@@ -35,7 +35,7 @@ export interface Settings {
   longResult: 'preview' | 'copy';
   /** 开机自动启动（登录 Windows 后在托盘静默运行） */
   autoStart: boolean;
-  /** 允许把拾屏自己的窗口也截进去（关闭时抓屏前先隐藏自己） */
+  /** 允许把拾屏自己的窗口也截进去：面板**此刻开着**才拍，绝不主动弹出它 */
   captureSelf: boolean;
 }
 

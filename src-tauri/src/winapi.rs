@@ -164,16 +164,29 @@ pub fn set_interactive(hwnd: HWND, interactive: bool) {
     ensure_styles_ex(hwnd, !interactive, !interactive, !interactive);
 }
 
-/// 启动 60Hz 穿透状态轮询线程（同时顺带维护配置面板窗口的样式）
+/// 启动 60Hz 穿透状态轮询线程（同时维护两个自有窗口的样式）
 ///
-/// 窗口隐藏时整段跳过：此时 webview 不渲染任何东西，穿透样式没有作用对象。
-/// `self_capture`（截取本软件自身）期间同样冻结：这一路径要保持 WS_EX_LAYERED
-/// 让透明区域不参与合成，被本线程切成不透明就等于拿自己的窗口盖住待截的桌面。
+/// ## 为什么隐藏时也要维护样式
 ///
-/// 顺带维护 `panel` 是因为 **tao 的 `show()` 会重置 exstyle**：`harden_panel` 在
-/// show 之前写好的 `WS_EX_TOOLWINDOW` 会被冲掉，拾屏面板就会在任务栏留下一个图标
-/// （运行时诊断实测 `main EX` 里 `TOOLWINDOW=false` 且带 `APPWINDOW`）。
-/// 与其另开一个线程，不如挂在这里：1Hz 一次即可，不必跟覆盖层一样 60Hz。
+/// 早期实现是「窗口不可见就整段 `continue`」，理由是隐藏时 webview 不渲染、样式没有
+/// 作用对象。这个前提是错的：**tao 会在窗口创建 / 首次显示时重置 exstyle**，而隐藏期
+/// 没人写回，于是样式就停留在 tao 的默认态。
+///
+/// 运行时诊断实测到 overlay 隐藏态 `GWL_EXSTYLE = 0x40118`
+/// （`LAYERED` / `TRANSPARENT` / `NOACTIVATE` 全 false、还带 `APPWINDOW`）——
+/// 就是一个**不透明的顶层窗口**。于是：
+///   第一次 show → 以不透明身份整块盖住屏幕 → **闪一下**；
+///   之后轮询在「可见」期间把样式写对了，hide 时样式保持正确，
+///   第二次 show 自然就不闪了。
+/// 用户描述的现象正是「第一次会，第二次不会」——完全对上。
+///
+/// 现在隐藏期也以 1Hz 钉住样式（`ensure_styles_ex` 内部有 `ex != cur` 判断，
+/// 实际不会产生多余的 `SetWindowLongPtrW`），保证**首次 show 之前样式就已经正确**。
+/// 启动后的前 3 秒频率更高一些，覆盖 tao 建窗初期的几次样式重建。
+///
+/// `self_capture`（截取本软件自身）期间冻结可见态的样式计算：这一路径要保持
+/// `WS_EX_LAYERED` 让透明区域不参与合成，被本线程切成不透明就等于拿自己的窗口
+/// 盖住待截的桌面。隐藏期的维护不受影响。
 pub fn start_passthrough_thread(
     hwnd: HWND,
     panel: HWND,
@@ -191,14 +204,22 @@ pub fn start_passthrough_thread(
         loop {
             std::thread::sleep(Duration::from_millis(16));
             tick = tick.wrapping_add(1);
+            // 建窗初期（~3s）tao 可能连续重建几次样式，频率拉高；之后回到 1Hz。
+            let idle_every: u32 = if tick < 180 { 3 } else { 60 };
 
-            // 面板样式维护：1Hz，且要放在下面那些 `continue` **之前** —— 覆盖层不可见时
-            // 整段会 continue 掉，那时恰恰也该顺带校正面板。面板隐藏时跳过，不去动它。
-            if tick % 60 == 0 && !panel.0.is_null() && unsafe { IsWindowVisible(panel) }.as_bool() {
+            // 面板样式维护：1Hz，同样要放在下面那些 `continue` **之前** ——
+            // 覆盖层不可见时整段会 continue 掉，那时恰恰也该顺带校正面板。
+            if tick % idle_every == 0 && !panel.0.is_null() {
                 harden_panel(panel);
             }
 
             if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                // 隐藏期同样钉住覆盖层的样式，否则首次 show 会闪一帧不透明。
+                // 隐藏时不会有贴图要跟随鼠标穿透，按当前模式给一个静态正确值即可。
+                if tick % idle_every == 0 {
+                    let in_overlay = overlay.load(Ordering::Relaxed);
+                    ensure_styles_ex(hwnd, !in_overlay, !in_overlay, !in_overlay);
+                }
                 continue;
             }
             if self_capture.load(Ordering::Relaxed) {

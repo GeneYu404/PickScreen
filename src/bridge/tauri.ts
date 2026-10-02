@@ -118,16 +118,29 @@ let lastNudge = 0;
 /**
  * 可见视口（CSS 像素）。
  *
- * 健康态下 innerWidth == screen.width（两者同为 DIP 口径），互为参照；
- * 一旦布局口径异常（远程会话/分辨率切换后 WebView2 视口被腰斩或谎报），
- * 触发 Rust 侧重下 bounds 自愈（Rust 按 物理窗口/真实DPI 计算，幂等，
- * 限流 2s）。收拢取两者较小值，保证面板始终落在可见区内。
- * 浏览器预览环境直接返回 innerWidth / innerHeight。
+ * **必须按窗口区分**，两类窗口的正确处理完全相反：
+ *
+ * - `overlay`（铺满整块虚拟桌面）：`innerWidth/innerHeight` **本身就是真值**，
+ *   因为 `cover_virtual_desktop()` 是按物理像素 `SetWindowPos` 铺满的。多屏时它等于
+ *   各屏 CSS 宽度之和。这里**既不能**拿 `window.screen`（那只是**主屏**尺寸）去
+ *   `min` 它，也**不能**触发 `renudge`：
+ *   - `min(iw, rw)` 会把虚拟桌面宽度压成主屏宽度，于是
+ *     `map.sx = 物理虚拟桌面宽 / 主屏宽`，坐标映射比例全错（窗口识别、穿透矩形、
+ *     滚轮代理、长截图物理坐标都跟着偏）。
+ *   - `renudge` 会 `set_size` 改窗口尺寸。铺满窗口一旦改尺寸，WebView2 视口随之
+ *     变化 → `ScreenFrame.resize()` 重算 canvas → 用户看到「画面突然缩放了一下」。
+ *     这是多屏下最刺眼的那个闪动，根因就在这里。
+ * - `main`（820×560 定宽配置面板）：`innerWidth ≈ screen.width`，两者同为 DIP 口径，
+ *   互为参照。布局口径异常时（远程会话 / 分辨率切换后 WebView2 视口被腰斩）触发
+ *   Rust 侧重下 bounds 自愈（按 物理窗口/真实DPI 计算，幂等，限流 2s）。
+ *
+ * 浏览器预览环境没有原生窗口，一律返回 innerWidth / innerHeight。
  */
 export async function viewportCss(): Promise<{ w: number; h: number }> {
   const iw = window.innerWidth;
   const ih = window.innerHeight;
   if (!isTauriEnv()) return { w: iw, h: ih };
+  if (currentWindowLabel() === 'overlay') return { w: iw, h: ih };
   const rw = window.screen.width || iw;
   const rh = window.screen.height || ih;
   if (Math.abs(iw - rw) > 4) {
@@ -309,6 +322,12 @@ export const NativeBridge = {
   async windowDiagnostics(label?: WindowLabel): Promise<string> {
     if (!isTauriEnv()) return '（浏览器预览，无原生窗口）';
     return (await invoke<string>('window_diagnostics', { label: label ?? currentWindowLabel() })) ?? '';
+  },
+
+  /** 读回虚拟桌面物理尺寸与系统 DPI（诊断用） */
+  async screenGeometry(): Promise<string> {
+    if (!isTauriEnv()) return '（浏览器预览）';
+    return (await invoke<string>('screen_geometry')) ?? '';
   },
 
   /* ===== 长截图（拼接器在 Rust 侧，与 A 共用实现） ===== */

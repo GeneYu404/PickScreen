@@ -119,10 +119,9 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
    - 本应用窗口之上 → 可主题化（配置面板、截图工具栏、长截图面板、托盘菜单）
 4. **60Hz 穿透轮询只服务 `overlay` 窗口。** `main` 是普通可交互窗口，不参与。
    `[data-region]` 同步也只从 `overlay` 窗口采集。
-   同一个线程顺带以 **1Hz** 校正 `main` 的样式（`tick % 60`）—— **tao 的 `show()`
-   会重置 exstyle**，把 `harden_panel` 在 show 之前写好的 `WS_EX_TOOLWINDOW` 冲掉，
-   拾屏面板就会在任务栏留下图标。校正必须放在那些 `continue` **之前**：覆盖层不可见时
-   整段会 continue，而那时恰恰也该校正面板。
+   同一个线程顺带以 **1Hz** 校正 `main` 的样式（`tick % 60`）。
+   另：**`tao` 的 `show()` 会重置 exstyle**（见第 11 条），所以 `set_window_visible`
+   必须在 show **之后**再延迟补钉一次，否则会闪一帧。
 5. **`main` 必须是 `transparent: false` 且不带 `WS_EX_LAYERED`。**
    `transparent: true` 会让 tao 给窗口加 `WS_EX_LAYERED`，而 `body` 恒为 transparent
    （`overlay` 需要），实色只铺在 `#root` 里 —— 整窗会被 alpha 混合成半透明。
@@ -136,17 +135,31 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
    `grab_screen` show 出来但 DOM 还没画上抓到的帧，列进去只是个空白候选）。
    该不该出现交给可见性判断：`capture_self` 关闭时 Rust 已藏了面板，
    `IsWindowVisible` 为 false 自动跳过。
-7. **抓屏的收尾必须在 Rust 侧做**：前端的 `set_window_visible` 与 `grab_screen` 的
-   invoke 并发，两种到达次序都成立。若「show 先到、grab 后到」，前端 `hasContent`
-   不会重跑，没人把窗口放回来——`grab_screen` 末尾必须自己 `set_window_visible(overlay, true)`。
-8. **`capture_self = true` 时，面板必须在场——由前端负责打开，Rust 只等。**
-   托盘常驻下面板绝大多数时间隐藏；从托盘/热键触发截图时它必然没开，若只是
-   「保持可见」，抓到的画面里根本没有面板，覆盖层升起来后底下空空如也
-   （用户看到的「主界面消失」）。
-   - **Rust 不能代劳** `set_window_visible(main, true)`：那只 show HWND，面板窗口的
-     React 还停在 `showMain=false`，会显示成一片**空白**。
-   - 正确分工：前端在 `captureSelf` 且面板未开时广播 `'show'`，由**面板窗口自己**
-     渲染出 UI；Rust 只轮询 `panel.is_visible()`（上限 1.2s）等它真的上屏。
+7. **抓屏时不要藏覆盖层 —— 靠「全透明分层窗口不参与合成」让 BitBlt 穿透它。**
+   `WS_EX_LAYERED` 且 alpha=0 的窗口**不参与桌面合成**，`BitBlt` 抓到的直接是它后面的
+   桌面。所以覆盖层可以**全程保持可见**，用不着「先藏后显」——而那正是闪烁的来源
+   （整块铺满虚拟桌面的层显隐一次 = 一次肉眼可见的闪动）。
+   固定时序（`App.tsx` 的 `startOverlay`）：
+   ```
+   清空内容(setOverlay(null) + setScreenImage(null) + setEraseRect(null) + setWindows([]))
+     → setPreparing(true) 让窗口以「空内容」显示出来
+     → nextPaint() 等 WebView2 提交完那帧空白（此刻它才是全透明且稳定的）
+     → grabScreen()   ← 此时不藏它，穿透抓屏
+     → setOverlay({mode}) + setScreenImage(bmp)
+     → nextPaint() → setPreparing(false) + setFrameReady(true)
+   ```
+   清空**必须**发生在窗口显示之前：只要残留上一帧图像或挂着的覆盖层 DOM（45% 黑遮罩），
+   `BitBlt` 就会一起拍进去。
+   `grab_screen` 在此期间置 `self_capture` 冻结 60Hz 轮询的样式计算，否则它可能把窗口
+   切成不透明，等于拿自己的窗口盖住待截的桌面；抓完解冻。显示时机由前端 `hasContent`
+   （`preparing` / `frameReady`）独占，`grab_screen` 不再自己 show/hide 覆盖层。
+8. **`capture_self` 只拍「此刻开着」的面板，绝不主动弹它。**
+   语义是「面板开着就一起拍进去」，**不是**「为了拍它而先把面板叫出来」——
+   托盘常驻下面板常态隐藏，若在 `startOverlay` 里广播 `'show'` 强行弹出，用户在后台按
+   一次热键就被面板糊一脸，而**大多数时候他并不想要这个**。要截自身时，用户自己先打开
+   面板再截图。UI 文案已同步为这个语义。
+   Rust 侧因此也**不必**为等面板出现而阻塞：`capture_self` 分支里只有 `panel_visible`
+   为真时才等首帧交完，否则直接抓（否则每次后台截图都要白等一个上限）。
 9. **抓屏要等两个不同的东西，`DwmFlush` 只管其中一个。**
    `DwmFlush` 等的是 DWM 合成队列，**等不到** WebView2 提交自己的 DirectComposition
    表面（另一次异步提交）。所以顺序是：等面板可见 → 等前端 `mark_panel_painted`
@@ -154,6 +167,37 @@ force push 默认禁止，且只能用 `--force-with-lease`，绝不能 `--force
    **固定 sleep 猜不准这个时长**，且首次启动的冷启动远大于任何经验值。
    上报时刻是「一次性」的，所以 `elapsed() >= SETTLE` 在之后永远成立 —— 它只保证
    「面板画过」，**不保证「面板此刻在屏幕上」**，在场与否要靠第 8 条单独判断。
+10. **`viewportCss()` 必须按窗口分叉，别再对两个窗口用同一套判据。**
+   `window.screen.width` 只是**主屏**尺寸，而 `overlay` 的 `window.innerWidth` 是
+   **各屏相加**的虚拟桌面宽度 —— 多屏下两者本来就不相等。据此会出两个 bug：
+   - `Math.abs(iw - rw) > 4` 永远成立 → 每次 `grabScreen` 都触发 `renudge` →
+     `set_size` 改窗口尺寸 → WebView2 视口变化 → `ScreenFrame.resize()` 重算 canvas →
+     用户看到「画面突然缩放了一下」（`renudge` 有 2s 节流，所以表现为「有时会」）。
+   - `Math.min(iw, rw)` 把虚拟桌面宽度压成主屏宽度 → `map.sx = 物理虚拟桌面宽 / 主屏宽`，
+     坐标映射比例全错，连带影响**窗口识别 / 穿透矩形 / 滚轮代理 / 长截图物理坐标**。
+   - 正确做法：`overlay` 直接返回 `innerWidth/innerHeight`（它由 `cover_virtual_desktop`
+     按物理像素铺满，本身就是真值）；`main`（820×560 定宽）才做 `screen` 互校 + renudge
+     自愈。
+11. **tao 会重置 exstyle —— 保证手段是「隐藏期也维护样式」，不是「show 之后补写」。**
+   `WebviewWindow::show()` 内部是 `dispatcher.send_message(...)`，即 **PostMessage**。
+   所以「先写样式、再 `show()`」写进去的位会被 tao 稍后真正执行 `set_visible` 时**清掉**；
+   而「show 之后同步补写」同样无效（会落在 tao 前面）。曾试过 show 之后**延迟 20ms**
+   补钉——那是治标：闪的那一帧早就过去了。
+   运行时诊断实测 overlay 隐藏态 `GWL_EXSTYLE = 0x40118`
+   （`LAYERED / TRANSPARENT / NOACTIVATE` **全 false** 且带 `APPWINDOW`）——
+   就是一个**不透明的顶层窗口**。于是首次 show 它会**整块盖住整个屏幕** → 闪一下；
+   之后轮询在「可见」期间把样式写对了，hide 时样式保持正确，**第二次 show 自然不闪**。
+   （用户描述的正是「第一次会，第二次不会」，这个「第二次」是定位的关键线索。）
+   正确修法在 `start_passthrough_thread`：**隐藏期也以 1Hz 钉样式**（内部有 `ex != cur`
+   判断，不会产生多余写入；建窗初期前 3s 频率更高，覆盖 tao 的连续几次重建）。
+   `set_window_visible` 里保留 show **之前**按当前模式写一次，覆盖「刚切模式就 show」。
+12. **canvas 的 backing store 要锁定为抓屏帧的真实物理尺寸，别拿 `devicePixelRatio` 推。**
+   `ScreenFrame.dpr` 的语义是「**物理像素 ÷ CSS 像素**」，不是 `window.devicePixelRatio`
+   （那只反映主屏）。窗口铺满虚拟桌面时视口可能随 show 后 WebView2 定下而变化，
+   `resize()` 若按 `innerWidth × devicePixelRatio` 重算，图像就会按新比例重新拉伸
+   绘制 —— 用户看到「画面突然缩放了一下」。
+   现在：`setScreenImage(frame)` 把 `canvas.width/height` 锁成 `frame.width/height`（1:1），
+   `resize()` **只改 CSS 尺寸**，缩放交给浏览器平滑处理，内容比例恒定。
 
 另：托盘菜单用浅色 `bg-acrylic` 是**对的** —— Windows 11 原生右键菜单本身就是浅色亚克力，
 那是正常窗口表面，不是穿透层。

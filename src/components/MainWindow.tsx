@@ -149,11 +149,16 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong, onToas
     let alive = true;
     // 一并回报 DOM 侧的 data-win：不透明靠它生效，它若没设上，面板必然是半透明的。
     const dom = document.documentElement.getAttribute('data-win') || '未设置(!)';
+    const dpr = window.devicePixelRatio || 1;
+    // 覆盖层把抓屏帧画到 canvas 上：画面变形/跳变取决于 canvas 的 backing store
+    // 像素尺寸与帧的物理尺寸是否一致。这两个数字直接摆出来。
+    const vp = `视口CSS=${window.innerWidth}x${window.innerHeight} dpr=${dpr.toFixed(2)}`;
     void Promise.all([
       NativeBridge.windowDiagnostics('main'),
       NativeBridge.windowDiagnostics('overlay'),
+      NativeBridge.screenGeometry(),
     ]).then((parts) => {
-      if (alive) setDiag(`DOM=${dom}　|　${parts.join('　|　')}`);
+      if (alive) setDiag(`${dom} | ${vp} | ${parts.join(' | ')}`);
     });
     return () => {
       alive = false;
@@ -350,7 +355,7 @@ export function MainWindow({ settings, onChange, onClose, onShot, onLong, onToas
               <Row title="开机自动启动" desc="登录 Windows 后在托盘静默运行（写入注册表，无需管理员）">
                 <Toggle on={settings.autoStart} disabled={autoStartBusy} onChange={() => void toggleAutoStart()} />
               </Row>
-              <Row title="允许截取拾屏自身" desc="开启后截图里会包含本软件的面板；关闭则抓屏前先隐藏自己（默认）">
+              <Row title="允许截取拾屏自身" desc="开启后，若拾屏面板正开着，截图会把它一起拍进去；后台截图时不会自动弹出面板">
                 <Toggle on={settings.captureSelf} onChange={(v) => set('captureSelf', v)} />
               </Row>
               <Row title="关闭主窗口时最小化到托盘">
